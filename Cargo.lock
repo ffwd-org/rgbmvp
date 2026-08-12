@@ -2830,7 +2830,7 @@ dependencies = [
  "daggy",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
- "hex-conservative 0.2.2",
+ "hex-conservative 1.2.0",
  "mime",
  "rand 0.9.5",
  "rgb-aluvm",

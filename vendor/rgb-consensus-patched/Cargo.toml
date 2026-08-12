@@ -41,7 +41,7 @@ chrono = "0.4.38"
 daggy = { version = "0.9.0", features = [
     "serde-1",
 ] }
-hex-conservative = "0.2.1"
+hex-conservative = "1.2.0"
 mime = "~0.3.17"
 rand = "0.9.1"
 ripemd = "0.1.3"
