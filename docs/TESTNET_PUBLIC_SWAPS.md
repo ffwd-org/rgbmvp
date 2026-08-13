@@ -142,6 +142,10 @@ the full 1,800-sat capacity. If the soak establishes lower safe fees, all three
 fee inputs and the maximum reservation can be reviewed together. If BTC runs low the demo
 **pauses gracefully** (503), never drains or crashes.
 
+Under-reservation fails closed at startup, and unexpected actual fees are
+recorded without clamping; see
+[T1_FEE_UNDER_RESERVATION_REMEDIATION.md](./T1_FEE_UNDER_RESERVATION_REMEDIATION.md).
+
 ---
 
 ## 2. Architecture — the constrained trigger
@@ -231,7 +235,9 @@ measured BTC scarcity). Implement each as config so they tune without a redeploy
 - New Cloud Run profile (or a `deploy/cloudrun-demo.yaml`) diffed from the freeze:
   `LABD_DEMO_SWAPS=1`, Secret Manager mounts, persistent volume, `min-instances=1`,
   egress allowed to public **Esplora + Electrum** testnet endpoints.
-- Keep the freeze profile as the **rollback** target (one redeploy away).
+- Keep `deploy/cloudrun-demo-freeze.yaml` as the **same-service rollback**
+  target for `rgbmvp-demo`. `deploy/cloudrun.yaml` targets the independent
+  `rgbmvp-public` service and is not a T1 rollback.
 - Budget alerts + max-instances cap to bound cost.
 
 ### W7 — Observability & ops
@@ -271,9 +277,12 @@ a preimage-redaction regression test.
 **Daily soak checklist:** budget remaining · both floats vs floors · error rate ·
 one end-to-end swap spot-checked on the explorer · cost vs budget alert.
 
-**Incident response:** kill switch is `LABD_DEMO_SWAPS=0` (one `gcloud run
-services update`); full rollback is redeploying `deploy/cloudrun.yaml`. Both are
-in [`deploy/README.md` §5.6](../deploy/README.md).
+**Incident response:** kill switch is `LABD_DEMO_SWAPS=0` on `rgbmvp-demo`,
+followed by `update-traffic --to-latest` and an `enabled == false` check. After
+active sessions are resolved and exits swept, full rollback replaces that same
+service with `deploy/cloudrun-demo-freeze.yaml`; `deploy/cloudrun.yaml` must not
+be used because it names `rgbmvp-public`. See
+[`deploy/README.md` §5.6](../deploy/README.md).
 
 ### W8 — Testing (before public exposure)
 - Abuse simulation: hammer `/v1/demo/swap` past per-IP and global limits;

@@ -67,7 +67,8 @@ Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
   created. Recovered reservations and unknown execution outcomes remain charged;
   corrupt/unreadable budget state blocks startup. Only a proven pre-execution
   failure may release a reservation. The maximum must include the BTC funding,
-  claim/refund, and exit-sweep fees.
+  claim/refund, and exit-sweep fees. Startup refuses under-reservation, and
+  runtime settlement records actual fees without clamping them to the reserve.
 - Custody (`lab_core::custody`) resolves keys from `RGBMVP_SECRET_DIR`
   (colon-separated) before local wallet dirs, and labd refuses to start on a
   public bind without it, or with a group/world-readable key.
@@ -85,6 +86,9 @@ Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
   disable T1, finish/refund legacy sessions, sweep all exits, then rotate.
 - `RGBMVP_DATA_DIR` must be persistent in deployment. Follow
   `docs/T1_FEE_BUDGET_REMEDIATION.md`; never bypass a budget-recovery refusal.
+- T1 rollback must target the live `rgbmvp-demo` service with
+  `deploy/cloudrun-demo-freeze.yaml`. `deploy/cloudrun.yaml` names the separate
+  `rgbmvp-public` service and cannot disable or replace T1.
 
 ## Local development
 

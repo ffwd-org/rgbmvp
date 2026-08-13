@@ -20,10 +20,11 @@ execution.
 
 ## Remediated invariant
 
-The budget now accounts for:
+Every new admission is allowed only when:
 
 ```text
-fee_spent_sats + fee_reserved_sats + fee_committed_sats <= fee_budget_sats
+fee_spent_sats + fee_reserved_sats + fee_committed_sats
+  + next_reservation_sats <= fee_budget_sats
 ```
 
 - `spent`: known BTC funding and claim/refund fees.
@@ -42,6 +43,12 @@ The default reservation is now **1,800 sats**: 800 funding + 500 claim/refund +
 those configured fees. The 28,000-sat ceiling therefore permits at most
 **15 admissions**, leaving 1,000 sats of accounting headroom. Batching may make
 the actual sweep cheaper, but the ceiling does not depend on that saving.
+
+Settlement records actual and committed fees in full, without clamping them to
+the reservation. An unexpected overrun can therefore make accounted expenditure
+exceed the ceiling; that accurate state reports zero remaining swaps and blocks
+all later admission. See
+[T1_FEE_UNDER_RESERVATION_REMEDIATION.md](./T1_FEE_UNDER_RESERVATION_REMEDIATION.md).
 
 ## Durable write and recovery protocol
 

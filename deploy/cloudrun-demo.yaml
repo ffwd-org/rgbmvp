@@ -13,8 +13,10 @@
 #   min 0 / max 1                   min 1 / max 1            <-- refund watcher must keep running
 #   runtime SA: no roles            runtime SA: secretAccessor + storage on ONE bucket
 #
-# ROLLBACK = redeploy deploy/cloudrun.yaml. That single step removes the keys,
-# the volume, and the public mutation in one revision.
+# FULL ROLLBACK = replace this SAME service with
+# deploy/cloudrun-demo-freeze.yaml, then route 100% of traffic to latest.
+# deploy/cloudrun.yaml names a different service (rgbmvp-public) and cannot
+# roll back rgbmvp-demo.
 #
 # Mainnet is refused at config load regardless of anything here.
 #

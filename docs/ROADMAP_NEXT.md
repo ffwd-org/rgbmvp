@@ -198,7 +198,7 @@ between the lab's own wallets.
 | W3 Secret Manager custody + startup preflight | Implemented |
 | W4 budget persistence across restart | Implemented |
 | W5 refund / recycle watcher | Implemented |
-| W6 deploy profile + persistent volume | `deploy/cloudrun-demo.yaml` + runbook |
+| W6 deploy + same-service rollback profiles | `deploy/cloudrun-demo.yaml` + `deploy/cloudrun-demo-freeze.yaml` + runbook |
 | W7 observability / alert thresholds | Documented; quota field contract pinned by test |
 | W8 abuse + chaos tests | Implemented |
 | W9 public UX | **Implemented** — Turnstile browser pass still unproven |

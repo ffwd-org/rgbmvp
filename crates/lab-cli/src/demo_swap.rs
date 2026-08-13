@@ -90,11 +90,21 @@ impl DemoFees {
         }
     }
 
-    /// Total BTC fee controlled by one swap (fund + claim/refund + sweep).
-    pub fn btc_total_per_swap(&self) -> u64 {
-        self.btc_fee_sats
-            .saturating_add(self.btc_claim_fee_sats)
-            .saturating_add(self.btc_sweep_fee_sats)
+    /// Refuse T1 when its admission reservation cannot cover every configured
+    /// BTC transaction fee controlled by one swap.
+    pub fn validate_reservation(&self, max_fee_per_swap_sats: u64) -> Result<()> {
+        let required = u128::from(self.btc_fee_sats)
+            + u128::from(self.btc_claim_fee_sats)
+            + u128::from(self.btc_sweep_fee_sats);
+        anyhow::ensure!(
+            required <= u128::from(max_fee_per_swap_sats),
+            "configured BTC fees ({required} = {} fund + {} claim/refund + {} sweep) \
+             exceed LABD_DEMO_MAX_FEE_SATS ({max_fee_per_swap_sats})",
+            self.btc_fee_sats,
+            self.btc_claim_fee_sats,
+            self.btc_sweep_fee_sats
+        );
+        Ok(())
     }
 }
 
@@ -789,6 +799,30 @@ pub fn quota_json(gov: &DemoGovernor, floats: Option<Floats>) -> Value {
 mod tests {
     use super::*;
 
+    fn test_fees() -> DemoFees {
+        DemoFees {
+            btc_fee_sats: 800,
+            btc_claim_fee_sats: 500,
+            btc_sweep_fee_sats: 500,
+            lq_fee_sats: 300,
+            lq_sweep_fee_sats: 400,
+        }
+    }
+
+    #[test]
+    fn fee_reservation_validation_fails_closed() {
+        let fees = test_fees();
+        assert!(fees.validate_reservation(1_800).is_ok());
+        assert!(fees.validate_reservation(1_799).is_err());
+
+        let overflowing = DemoFees {
+            btc_fee_sats: u64::MAX,
+            btc_claim_fee_sats: 1,
+            ..fees
+        };
+        assert!(overflowing.validate_reservation(u64::MAX).is_err());
+    }
+
     #[test]
     fn demo_swap_ids_are_path_safe() {
         for seq in [0u64, 1, 42, 99_999] {
@@ -803,7 +837,7 @@ mod tests {
     /// The driver must never emit an RGB-wrapped or oversized leg.
     #[test]
     fn driver_steps_are_value_only_and_fixed() {
-        let steps = driver_steps(1_000, DemoFees { btc_fee_sats: 800, btc_claim_fee_sats: 500, btc_sweep_fee_sats: 500, lq_fee_sats: 300, lq_sweep_fee_sats: 400 });
+        let steps = driver_steps(1_000, test_fees());
         assert_eq!(steps.len(), 4);
         for (name, payload) in &steps {
             assert_eq!(
@@ -824,7 +858,7 @@ mod tests {
 
     #[test]
     fn driver_steps_follow_htlc_order() {
-        let steps = driver_steps(1_000, DemoFees { btc_fee_sats: 800, btc_claim_fee_sats: 500, btc_sweep_fee_sats: 500, lq_fee_sats: 300, lq_sweep_fee_sats: 400 });
+        let steps = driver_steps(1_000, test_fees());
         let names: Vec<&str> = steps.iter().map(|(n, _)| *n).collect();
         // Alice must claim Liquid (revealing the preimage) before Bob claims BTC.
         assert_eq!(names, vec!["fund_btc", "fund_lq", "claim_lq", "claim_btc"]);

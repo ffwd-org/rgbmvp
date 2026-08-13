@@ -100,17 +100,8 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         // fees we actually pay exceed that, the reservation under-counts and the
         // run can overshoot its ceiling.
         let fees = DemoFees::from_env();
-        if fees.btc_total_per_swap() > p.max_fee_per_swap_sats {
-            anyhow::bail!(
-                "T1 refused: BTC fees per swap ({} = {} fund + {} claim/refund + {} sweep) exceed \
-                 LABD_DEMO_MAX_FEE_SATS ({}); budget reservation would be unsound",
-                fees.btc_total_per_swap(),
-                fees.btc_fee_sats,
-                fees.btc_claim_fee_sats,
-                fees.btc_sweep_fee_sats,
-                p.max_fee_per_swap_sats
-            );
-        }
+        fees.validate_reservation(p.max_fee_per_swap_sats)
+            .context("T1 refused: budget reservation would be unsound")?;
         // W3: refuse to sign with image-baked or over-permissive key material.
         // Public = anything not bound to loopback, or explicitly read-only mode.
         let wallets = DemoWallets::from_env();

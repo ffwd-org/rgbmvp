@@ -415,8 +415,9 @@ impl DemoGovernor {
 
     /// Release the in-flight slot and settle the actual fee spent.
     ///
-    /// `actual_fee_sats` is clamped to the reservation: a runaway fee cannot
-    /// retroactively blow past the reserved worst case in the accounting.
+    /// Actual fees are never clamped to the reservation. A runtime overrun may
+    /// take accounted spend past the ceiling, but recording it in full ensures
+    /// every later admission fails instead of hiding expenditure.
     pub fn finish(&self, actual_fee_sats: u64) {
         self.finish_with_liability(actual_fee_sats, 0);
     }
@@ -427,11 +428,10 @@ impl DemoGovernor {
         let mut st = self.lock();
         let reserved = self.policy.max_fee_per_swap_sats.min(st.fee_reserved_sats);
         st.fee_reserved_sats -= reserved;
-        let spent = actual_fee_sats.min(reserved);
-        st.fee_spent_sats = st.fee_spent_sats.saturating_add(spent);
+        st.fee_spent_sats = st.fee_spent_sats.saturating_add(actual_fee_sats);
         st.fee_committed_sats = st
             .fee_committed_sats
-            .saturating_add(committed_fee_sats.min(reserved.saturating_sub(spent)));
+            .saturating_add(committed_fee_sats);
         st.in_flight = st.in_flight.saturating_sub(1);
     }
 
@@ -724,15 +724,24 @@ mod tests {
         assert_eq!(st.fee_spent_sats, 0, "actual fee remains unknown");
     }
 
-    /// An over-budget actual fee cannot exceed what was reserved.
     #[test]
-    fn actual_fee_clamped_to_reservation() {
-        let g = DemoGovernor::new(policy());
+    fn actual_fee_overrun_is_fully_accounted_and_stops_admission() {
+        let g = DemoGovernor::new(DemoSwapPolicy {
+            fee_budget_sats: DEFAULT_MAX_FEE_PER_SWAP_SATS,
+            global_min_interval_secs: 0,
+            ..policy()
+        });
         assert!(g.try_admit("1.1.1.1", T0, rich()).is_ok());
-        g.finish(u64::MAX);
+        g.finish_with_liability(2_300, 500);
         let st = g.status(T0);
-        assert_eq!(st.fee_spent_sats, DEFAULT_MAX_FEE_PER_SWAP_SATS);
+        assert_eq!(st.fee_spent_sats, 2_300);
+        assert_eq!(st.fee_committed_sats, 500);
         assert_eq!(st.fee_reserved_sats, 0);
+        assert_eq!(g.swaps_remaining_in_budget(), 0);
+        assert_eq!(
+            g.try_admit("2.2.2.2", T0 + 1, rich()),
+            Err(DemoDenial::FeeBudgetExhausted)
+        );
     }
 
     #[test]
