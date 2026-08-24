@@ -44,7 +44,7 @@ jobs:
           # Root copies so status.html CANDIDATES resolve on Vercel
           cp artifacts/public/manifest.json public/manifest.json
           cp deploy/vercel.json vercel.json
-      - uses: amondnet/vercel-action@v25
+      - uses: amondnet/vercel-action@v42
         if: steps.gate.outputs.skip != 'true'
         with:
           vercel-token: ${{ secrets.VERCEL_TOKEN }}
