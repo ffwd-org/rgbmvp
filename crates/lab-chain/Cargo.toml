@@ -15,4 +15,4 @@ reqwest.workspace = true
 lwk_wollet.workspace = true
 lwk_signer.workspace = true
 lwk_common.workspace = true
-elements = "0.25"
+elements = "0.26"

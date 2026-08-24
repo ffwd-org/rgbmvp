@@ -15,7 +15,7 @@ bech32 = "0.12"
 amplify = "=4.8.1"
 sha2 = "0.10"
 bitcoin = { version = "0.32", features = ["std", "rand-std"] }
-elements = "0.25"
+elements = "0.26"
 
 # Pin rc.10 to match vendored WitnessTx patch (do not float to rc.11).
 rgb-consensus = { version = "=0.11.1-rc.10" }
