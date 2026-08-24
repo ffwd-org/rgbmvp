@@ -11,7 +11,7 @@
 //! and this module resolves signing material from there first.
 //!
 //! Resolution order for wallet `<name>`, secret `<kind>` (`mnemonic`, `wif`,
-//! or the T1-only `seed`):
+//! `descriptor`, or the T1-only `seed`):
 //!   1. `<dir>/<name>/<kind>` for each dir in `RGBMVP_SECRET_DIR`
 //!   2. `<dir>/<name>.<kind>` for each dir (flat mount layout)
 //!   3. `$RGBMVP_WALLET_DIR/<name>/<kind>` (local development)
@@ -30,6 +30,9 @@ use anyhow::{bail, Result};
 /// Secret kinds this project stores per wallet.
 pub const KIND_MNEMONIC: &str = "mnemonic";
 pub const KIND_WIF: &str = "wif";
+/// LWK wallet descriptor. Private descriptors are signing material and must be
+/// mounted with the same custody protections as mnemonics and WIFs.
+pub const KIND_DESCRIPTOR: &str = "descriptor";
 /// T1 root seed used only for hardened derivation of demo HTLC exit keys.
 pub const DEMO_EXIT_SECRET_NAME: &str = "demo-exits";
 pub const KIND_EXIT_SEED: &str = "seed";
@@ -140,9 +143,9 @@ impl CustodyIssue {
                  mount wallet secrets from Secret Manager instead of shipping them in the image"
                     .into()
             }
-            CustodyIssue::LoosePermissions { path } => format!(
-                "secret {path} is readable by group/other; tighten to 0400/0600"
-            ),
+            CustodyIssue::LoosePermissions { path } => {
+                format!("secret {path} is readable by group/other; tighten to 0400/0600")
+            }
             CustodyIssue::BakedIntoImage { path } => format!(
                 "secret {path} lives inside the application directory and would be baked into \
                  the published image; mount it from Secret Manager instead"
@@ -273,8 +276,7 @@ mod tests {
         fs::write(wdir.join("bob").join("mnemonic"), "from-disk").unwrap();
 
         let got =
-            resolve_secret_path(&[sdir.clone()], &wdir.join("bob"), "bob", KIND_MNEMONIC)
-                .unwrap();
+            resolve_secret_path(&[sdir.clone()], &wdir.join("bob"), "bob", KIND_MNEMONIC).unwrap();
         assert_eq!(fs::read_to_string(got).unwrap(), "from-mount");
         let _ = fs::remove_dir_all(&root);
     }
@@ -324,12 +326,9 @@ mod tests {
             KIND_EXIT_SEED,
         )
         .is_some());
-        assert!(resolve_mounted_secret_path(
-            &[sdir],
-            DEMO_EXIT_SECRET_NAME,
-            KIND_EXIT_SEED,
-        )
-        .is_none());
+        assert!(
+            resolve_mounted_secret_path(&[sdir], DEMO_EXIT_SECRET_NAME, KIND_EXIT_SEED,).is_none()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -449,7 +448,9 @@ mod tests {
 
     #[test]
     fn image_paths_are_detected() {
-        assert!(looks_like_image_path(Path::new("/app/wallets/bob/mnemonic")));
+        assert!(looks_like_image_path(Path::new(
+            "/app/wallets/bob/mnemonic"
+        )));
         assert!(!looks_like_image_path(Path::new("/secrets/bob/mnemonic")));
         assert!(!looks_like_image_path(Path::new("/tmp/app/x")));
     }

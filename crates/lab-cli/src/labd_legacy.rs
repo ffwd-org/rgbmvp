@@ -14,9 +14,9 @@ use lab_rgb::storage::RgbStore;
 use lab_rgb::swap::SwapStore;
 
 use crate::http_api::{
-    demo_activity, demo_wallets, handle_bfa_audit_post, handle_rgb_issue_post,
-    handle_rgb_transfer_post, handle_swap_action_post, handle_swap_init_post, handle_verify_post,
-    list_rgb_contracts, list_swap_ids, public_swap_view,
+    demo_activity, demo_wallets, handle_bfa_audit_post, handle_bfa_audit_post_public,
+    handle_rgb_issue_post, handle_rgb_transfer_post, handle_swap_action_post,
+    handle_swap_init_post, handle_verify_post, list_rgb_contracts, list_swap_ids, public_swap_view,
 };
 
 pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
@@ -39,7 +39,9 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
     eprintln!("  GET  /v1/demo/wallets · /v1/demo/activity");
     eprintln!("  GET  /v1/rgb/contracts · /v1/rgb/plans/{{id}}");
     if sec.public_read_only {
-        eprintln!("  POST (mutations)       DISABLED unless Authorization: Bearer <LABD_API_TOKEN>");
+        eprintln!(
+            "  POST (mutations)       DISABLED unless Authorization: Bearer <LABD_API_TOKEN>"
+        );
     } else {
         eprintln!("  POST /v1/rgb/issue · transfer · verify");
         eprintln!("  POST /v1/swap/init · /v1/swap/{{id}}/action · /v1/audit/bfa");
@@ -124,7 +126,7 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
         }
 
         // U4 mutation gate
-        if is_mutation_method(method) {
+        if is_mutation_method(method) && path != "/v1/audit/bfa" {
             match sec.authorize_mutation(authorization.as_deref()) {
                 AuthDecision::Allow => {}
                 AuthDecision::Deny {
@@ -157,11 +159,7 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
 
         // CORS preflight for browser tools
         let (status, content_type, body) = if method == "OPTIONS" {
-            (
-                "204 No Content",
-                "text/plain",
-                Vec::new(),
-            )
+            ("204 No Content", "text/plain", Vec::new())
         } else if method == "GET" && path == "/v1/security" {
             let j = serde_json::to_vec_pretty(&lab_api::security_json(
                 sec.public_read_only,
@@ -170,9 +168,7 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
             ))
             .unwrap();
             ("200 OK", "application/json", j)
-        } else if method == "GET"
-            && (path == "/" || path == "/index.html")
-        {
+        } else if method == "GET" && (path == "/" || path == "/index.html") {
             let html = fs::read_to_string(web_dir.join("index.html")).unwrap_or_else(|_| {
                 "<html><body><h1>rgbmvp verifier</h1><p>missing web/index.html</p></body></html>"
                     .into()
@@ -281,18 +277,18 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                     serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "code": "bad_id", "status": "error"})).unwrap(),
                 )
             } else {
-            match store.load_proof(id) {
-                Ok(p) => (
-                    "200 OK",
-                    "application/json",
-                    serde_json::to_vec_pretty(&p).unwrap(),
-                ),
-                Err(e) => (
-                    "404 Not Found",
-                    "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string()})).unwrap(),
-                ),
-            }
+                match store.load_proof(id) {
+                    Ok(p) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::to_vec_pretty(&p).unwrap(),
+                    ),
+                    Err(e) => (
+                        "404 Not Found",
+                        "application/json",
+                        serde_json::to_vec(&serde_json::json!({"error": e.to_string()})).unwrap(),
+                    ),
+                }
             }
         } else if method == "GET" && path == "/v1/swaps" {
             match list_swap_ids(&cfg.data_dir) {
@@ -318,21 +314,24 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                     serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "code": "bad_id", "status": "error"})).unwrap(),
                 )
             } else {
-            match swap_store.load(id) {
-                Ok(s) => {
-                    let public = public_swap_view(&s, cfg);
-                    (
-                        "200 OK",
+                match swap_store.load(id) {
+                    Ok(s) => {
+                        let public = public_swap_view(&s, cfg);
+                        (
+                            "200 OK",
+                            "application/json",
+                            serde_json::to_vec_pretty(&public).unwrap(),
+                        )
+                    }
+                    Err(e) => (
+                        "404 Not Found",
                         "application/json",
-                        serde_json::to_vec_pretty(&public).unwrap(),
-                    )
+                        serde_json::to_vec(
+                            &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                        )
+                        .unwrap(),
+                    ),
                 }
-                Err(e) => (
-                    "404 Not Found",
-                    "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
-                ),
-            }
             }
         } else if method == "POST" && path == "/v1/swap/init" {
             let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
@@ -346,7 +345,10 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                 Err(e) => (
                     "400 Bad Request",
                     "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
+                    serde_json::to_vec(
+                        &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                    )
+                    .unwrap(),
                 ),
             }
         } else if method == "POST" && path.starts_with("/v1/swap/") && path.ends_with("/action") {
@@ -364,18 +366,21 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                     serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "code": "bad_id", "status": "error"})).unwrap(),
                 )
             } else {
-            match handle_swap_action_post(cfg, &swap_store, mid, body_str) {
-                Ok(v) => (
-                    "200 OK",
-                    "application/json",
-                    serde_json::to_vec_pretty(&v).unwrap(),
-                ),
-                Err(e) => (
-                    "400 Bad Request",
-                    "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
-                ),
-            }
+                match handle_swap_action_post(cfg, &swap_store, mid, body_str) {
+                    Ok(v) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::to_vec_pretty(&v).unwrap(),
+                    ),
+                    Err(e) => (
+                        "400 Bad Request",
+                        "application/json",
+                        serde_json::to_vec(
+                            &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                        )
+                        .unwrap(),
+                    ),
+                }
             }
         } else if method == "GET" && path == "/v1/demo/wallets" {
             match demo_wallets(cfg) {
@@ -413,7 +418,10 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                 Err(e) => (
                     "500 Internal Server Error",
                     "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
+                    serde_json::to_vec(
+                        &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                    )
+                    .unwrap(),
                 ),
             }
         } else if method == "GET" && path.starts_with("/v1/rgb/plans/") {
@@ -425,18 +433,22 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                     serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "code": "bad_id", "status": "error"})).unwrap(),
                 )
             } else {
-            match store.load_transfer(id) {
-                Ok(p) => (
-                    "200 OK",
-                    "application/json",
-                    serde_json::to_vec_pretty(&serde_json::json!({"plan_id": id, "plan": p})).unwrap(),
-                ),
-                Err(e) => (
-                    "404 Not Found",
-                    "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
-                ),
-            }
+                match store.load_transfer(id) {
+                    Ok(p) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::to_vec_pretty(&serde_json::json!({"plan_id": id, "plan": p}))
+                            .unwrap(),
+                    ),
+                    Err(e) => (
+                        "404 Not Found",
+                        "application/json",
+                        serde_json::to_vec(
+                            &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                        )
+                        .unwrap(),
+                    ),
+                }
             }
         } else if method == "POST" && path == "/v1/rgb/verify" {
             // Rate-limit verify (Esplora-backed) per peer IP — U4 public soak.
@@ -452,20 +464,23 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                     .unwrap(),
                 )
             } else {
-            let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
-            let body_str = &req[body_start..];
-            match handle_verify_post(cfg, &store, body_str) {
-                Ok(v) => (
-                    "200 OK",
-                    "application/json",
-                    serde_json::to_vec_pretty(&v).unwrap(),
-                ),
-                Err(e) => (
-                    "400 Bad Request",
-                    "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
-                ),
-            }
+                let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
+                let body_str = &req[body_start..];
+                match handle_verify_post(cfg, &store, body_str) {
+                    Ok(v) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::to_vec_pretty(&v).unwrap(),
+                    ),
+                    Err(e) => (
+                        "400 Bad Request",
+                        "application/json",
+                        serde_json::to_vec(
+                            &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                        )
+                        .unwrap(),
+                    ),
+                }
             }
         } else if method == "POST" && path == "/v1/rgb/issue" {
             let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
@@ -479,7 +494,10 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                 Err(e) => (
                     "400 Bad Request",
                     "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
+                    serde_json::to_vec(
+                        &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                    )
+                    .unwrap(),
                 ),
             }
         } else if method == "POST" && path == "/v1/rgb/transfer" {
@@ -494,7 +512,10 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                 Err(e) => (
                     "400 Bad Request",
                     "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
+                    serde_json::to_vec(
+                        &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                    )
+                    .unwrap(),
                 ),
             }
         } else if method == "GET" && path == "/v1/audit/bfa/samples" {
@@ -510,7 +531,12 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
         } else if method == "POST" && path == "/v1/audit/bfa" {
             let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
             let body_str = &req[body_start..];
-            match handle_bfa_audit_post(body_str) {
+            let result = if sec.public_read_only {
+                handle_bfa_audit_post_public(body_str)
+            } else {
+                handle_bfa_audit_post(body_str)
+            };
+            match result {
                 Ok(v) => {
                     let code = if v.ok {
                         "200 OK"
@@ -526,7 +552,10 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                 Err(e) => (
                     "400 Bad Request",
                     "application/json",
-                    serde_json::to_vec(&serde_json::json!({"error": e.to_string(), "status": "error"})).unwrap(),
+                    serde_json::to_vec(
+                        &serde_json::json!({"error": e.to_string(), "status": "error"}),
+                    )
+                    .unwrap(),
                 ),
             }
         } else {

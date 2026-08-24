@@ -3,12 +3,12 @@ use std::fs;
 
 use anyhow::{Context, Result};
 use lab_core::Config;
+use lab_rgb::htlc;
 use lab_rgb::storage::RgbStore;
 use lab_rgb::swap::{self, SwapStore};
 use lab_rgb::{
     issue_nia, plan_transfer, verify_against_witness, IssueRequest, DEMO_INTERNAL_XONLY_HEX,
 };
-use lab_rgb::htlc;
 
 /// Public swap JSON: never expose preimage (shared `lab_api::public_swap_view`).
 pub(crate) fn public_swap_view(s: &lab_rgb::swap::SwapSession, cfg: &Config) -> serde_json::Value {
@@ -16,7 +16,10 @@ pub(crate) fn public_swap_view(s: &lab_rgb::swap::SwapSession, cfg: &Config) -> 
         .unwrap_or_else(|_| "https://blockstream.info/testnet".into());
     let mut v = lab_api::public_swap_view(s, &cfg.explorer_base, &btc_ex);
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("next_actions".into(), serde_json::json!(swap_next_actions(s)));
+        obj.insert(
+            "next_actions".into(),
+            serde_json::json!(swap_next_actions(s)),
+        );
         obj.insert("guide".into(), serde_json::json!(swap_guide(s)));
         obj.insert(
             "not_done_reason".into(),
@@ -24,11 +27,7 @@ pub(crate) fn public_swap_view(s: &lab_rgb::swap::SwapSession, cfg: &Config) -> 
         );
         obj.insert(
             "mode".into(),
-            serde_json::json!(if s.rgb_wrap {
-                "rgb_wrap"
-            } else {
-                "value_htlc"
-            }),
+            serde_json::json!(if s.rgb_wrap { "rgb_wrap" } else { "value_htlc" }),
         );
     }
     v
@@ -286,11 +285,7 @@ pub(crate) fn handle_swap_init_post(
             .and_then(|x| x.as_str())
             .unwrap_or("btc-alice"),
     );
-    let bob_lq = resolve_lq_wallet_name(
-        v.get("bob_lq")
-            .and_then(|x| x.as_str())
-            .unwrap_or("bob"),
-    );
+    let bob_lq = resolve_lq_wallet_name(v.get("bob_lq").and_then(|x| x.as_str()).unwrap_or("bob"));
     let btc_contract = v
         .get("btc_contract")
         .or_else(|| v.get("btc_contract_id"))
@@ -304,9 +299,7 @@ pub(crate) fn handle_swap_init_post(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     // refuse overwrite of existing without force
-    if store.path_exists(&id)
-        && !v.get("force").and_then(|x| x.as_bool()).unwrap_or(false)
-    {
+    if store.path_exists(&id) && !v.get("force").and_then(|x| x.as_bool()).unwrap_or(false) {
         anyhow::bail!("swap {id} already exists; pass force:true to overwrite");
     }
     let rgb_wrap = v.get("rgb_wrap").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -443,8 +436,7 @@ pub(crate) fn handle_swap_action_post(
             }
             let mut rgb_meta = serde_json::Value::Null;
             if do_wrap && s.btc_contract_id.is_some() && !leg_wrapped(&s.btc_rgb) {
-                rgb_meta =
-                    svc.fund_wrap_btc(cfg, &btc, &mut s, commitment_sats, entropy)?;
+                rgb_meta = svc.fund_wrap_btc(cfg, &btc, &mut s, commitment_sats, entropy)?;
             } else if do_wrap && leg_wrapped(&s.btc_rgb) {
                 rgb_meta = serde_json::json!({"status": "already_wrapped", "idempotent": true});
             }
@@ -642,11 +634,8 @@ pub(crate) fn handle_swap_action_post(
             }
             let btc = lab_btc::BtcConfig::from_env();
             let amount = s.btc_fund_sats.context("btc not funded")?;
-            let utxo = lab_btc::find_htlc_utxo(
-                &btc,
-                &s.htlc_btc.address_btc,
-                amount.saturating_sub(1),
-            )?;
+            let utxo =
+                lab_btc::find_htlc_utxo(&btc, &s.htlc_btc.address_btc, amount.saturating_sub(1))?;
             let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
             let (refund_sk, _) =
                 keyring.derive_for_session(&s.htlc_btc, &s.htlc_btc.refund_label)?;
@@ -692,8 +681,7 @@ pub(crate) fn handle_swap_action_post(
                 amount.saturating_sub(1),
             )?;
             let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
-            let (refund_sk, _) =
-                keyring.derive_for_session(&s.htlc_lq, &s.htlc_lq.refund_label)?;
+            let (refund_sk, _) = keyring.derive_for_session(&s.htlc_lq, &s.htlc_lq.refund_label)?;
             let ws = hex::decode(&s.htlc_lq.witness_script_hex)?;
             use bitcoin::key::{CompressedPublicKey, Secp256k1};
             use bitcoin::{Address, Network};
@@ -769,7 +757,10 @@ pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
         let role = std::fs::read_to_string(cfg.wallet_path(name).join("meta.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("role").and_then(|r| r.as_str().map(|x| x.to_string())));
+            .and_then(|v| {
+                v.get("role")
+                    .and_then(|r| r.as_str().map(|x| x.to_string()))
+            });
         wallets.push(serde_json::json!({
             "name": name,
             "chain": "liquid-testnet",
@@ -800,6 +791,85 @@ pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
         }));
     }
 
+    // A public deployment mounts the BTC signing key from Secret Manager, not
+    // under RGBMVP_WALLET_DIR. Its address file is safe public metadata and is
+    // sufficient for read-only balance discovery.
+    if !wallets
+        .iter()
+        .any(|w| w.get("name").and_then(|v| v.as_str()) == Some("btc-alice"))
+    {
+        let address_path = cfg.wallet_path("btc-alice").join("address");
+        if let Ok(address) = fs::read_to_string(address_path) {
+            let address = address.trim();
+            if address.starts_with("tb1") {
+                let bal = lab_btc::balance(cfg, &btc, "btc-alice").ok();
+                wallets.push(serde_json::json!({
+                    "name": "btc-alice",
+                    "chain": "bitcoin-testnet",
+                    "role": "btc-alice",
+                    "address": address,
+                    "btc_sats": bal.as_ref().map(|b| b.balance_sats),
+                    "utxo_count": bal.as_ref().map(|b| b.utxo_count),
+                    "explorer": format!(
+                        "{}/address/{}",
+                        btc.explorer_base.trim_end_matches('/'),
+                        address
+                    ),
+                    "source": "public-address-file",
+                }));
+            }
+        }
+    }
+
+    // Public Cloud Run deliberately does not persist Liquid descriptors: they
+    // contain private derivation material. The addresses-only registry is the
+    // safe fallback used by the board. Select known fields explicitly so a
+    // future registry extension cannot leak a mnemonic or descriptor.
+    let registry_path = cfg.data_dir.join("wallet_registry.json");
+    if let Ok(raw) = fs::read_to_string(registry_path) {
+        if let Ok(registry) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let known = ["alice", "bob", "carol", "maker", "lab0"];
+            for entry in registry
+                .get("wallets")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !known.contains(&name)
+                    || wallets
+                        .iter()
+                        .any(|w| w.get("name").and_then(|v| v.as_str()) == Some(name))
+                {
+                    continue;
+                }
+                let Some(address) = entry.get("address_0").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !address.starts_with("tlq1") {
+                    continue;
+                }
+                let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or(name);
+                wallets.push(serde_json::json!({
+                    "name": name,
+                    "chain": "liquid-testnet",
+                    "role": role,
+                    "address": address,
+                    "lbtc_sats": null,
+                    "balances_sats": null,
+                    "explorer": format!(
+                        "{}/address/{}",
+                        cfg.explorer_base.trim_end_matches('/'),
+                        address
+                    ),
+                    "source": "public-address-registry",
+                }));
+            }
+        }
+    }
+
     Ok(serde_json::json!({
         "updated": true,
         "note": "Read-only demo board. No send/swap actions from the browser.",
@@ -825,6 +895,42 @@ pub(crate) fn demo_activity(cfg: &Config) -> Result<serde_json::Value> {
                 "ui_url": format!("/?swap={}", s.id),
             }));
         }
+    }
+
+    // Published S3 evidence is redacted and ships in the public image. Include
+    // an explicitly selected summary without copying raw local SwapSession
+    // files, which may contain a preimage.
+    let artifacts_dir = std::env::var("LABD_ARTIFACTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("artifacts/public"));
+    for file in ["s3-rgbmvp-live.json", "s3-browser-20260724.json"] {
+        let Ok(raw) = fs::read_to_string(artifacts_dir.join(file)) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(id) = v.get("id").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if swaps
+            .iter()
+            .any(|s| s.get("id").and_then(|x| x.as_str()) == Some(id))
+        {
+            continue;
+        }
+        let value_path = v.get("value_path").unwrap_or(&v);
+        swaps.push(serde_json::json!({
+            "id": id,
+            "phase": v.get("phase").and_then(|x| x.as_str()).unwrap_or("done"),
+            "btc_fund_txid": value_path.get("btc_fund_txid"),
+            "lq_fund_txid": value_path.get("lq_fund_txid"),
+            "lq_claim_txid": value_path.get("lq_claim_txid"),
+            "btc_claim_txid": value_path.get("btc_claim_txid"),
+            "status_url": format!("/artifacts/public/{file}"),
+            "ui_url": format!("/artifacts/public/{file}"),
+            "source": "published-redacted-evidence",
+        }));
     }
 
     let mut transfers = Vec::new();
@@ -918,10 +1024,7 @@ pub(crate) fn handle_rgb_issue_post(
     body: &str,
 ) -> Result<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(body).context("json body")?;
-    let wallet = v
-        .get("wallet")
-        .and_then(|x| x.as_str())
-        .unwrap_or("alice");
+    let wallet = v.get("wallet").and_then(|x| x.as_str()).unwrap_or("alice");
     let name = v
         .get("name")
         .and_then(|x| x.as_str())
@@ -978,14 +1081,8 @@ pub(crate) fn handle_rgb_transfer_post(
         .or_else(|| v.get("contract_id"))
         .and_then(|x| x.as_str())
         .context("contract required")?;
-    let wallet = v
-        .get("wallet")
-        .and_then(|x| x.as_str())
-        .unwrap_or("alice");
-    let amount = v
-        .get("amount")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(600_000);
+    let wallet = v.get("wallet").and_then(|x| x.as_str()).unwrap_or("alice");
+    let amount = v.get("amount").and_then(|x| x.as_u64()).unwrap_or(600_000);
     let broadcast = v
         .get("broadcast")
         .and_then(|x| x.as_bool())
@@ -1001,29 +1098,29 @@ pub(crate) fn handle_rgb_transfer_post(
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
 
-    let issue = store
-        .load_issue(contract)
-        .or_else(|_| {
-            // try load by scanning contracts for matching contract_id
-            let data = &cfg.data_dir;
-            let dir = data.join("rgb/contracts");
-            if dir.exists() {
-                for e in fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
-                    let p = e.path();
-                    if p.extension().and_then(|x| x.to_str()) != Some("json") {
-                        continue;
-                    }
-                    if let Ok(raw) = fs::read_to_string(&p) {
-                        if let Ok(iss) = serde_json::from_str::<lab_rgb::IssueResult>(&raw) {
-                            if iss.contract_id == contract || p.file_stem().map(|s| s.to_string_lossy()) == Some(contract.into()) {
-                                return Ok(iss);
-                            }
+    let issue = store.load_issue(contract).or_else(|_| {
+        // try load by scanning contracts for matching contract_id
+        let data = &cfg.data_dir;
+        let dir = data.join("rgb/contracts");
+        if dir.exists() {
+            for e in fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(raw) = fs::read_to_string(&p) {
+                    if let Ok(iss) = serde_json::from_str::<lab_rgb::IssueResult>(&raw) {
+                        if iss.contract_id == contract
+                            || p.file_stem().map(|s| s.to_string_lossy()) == Some(contract.into())
+                        {
+                            return Ok(iss);
                         }
                     }
                 }
             }
-            anyhow::bail!("contract not found: {contract}");
-        })?;
+        }
+        anyhow::bail!("contract not found: {contract}");
+    })?;
 
     let chain = v
         .get("chain")
@@ -1109,19 +1206,38 @@ pub(crate) fn handle_rgb_transfer_post(
 
 /// POST /v1/audit/bfa — body is a BfaHistory JSON document (see docs/C3_CLOSED.md).
 pub(crate) fn handle_bfa_audit_post(body: &str) -> Result<lab_rgb::bfa::BfaAuditResult> {
-    let hist: lab_rgb::bfa::BfaHistory =
-        serde_json::from_str(body).context("BFA history JSON")?;
+    let hist: lab_rgb::bfa::BfaHistory = serde_json::from_str(body).context("BFA history JSON")?;
     let fetch = |txid: &str| -> Result<String> {
         // Prefer embedded witness_tx_hex; if missing, try Elements regtest RPC helper.
         let out = std::process::Command::new("./scripts/regtest_simplicity.sh")
             .args(["cli", "getrawtransaction", txid])
             .output();
         match out {
-            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            Ok(o) if o.status.success() => {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
             _ => anyhow::bail!(
                 "no witness_tx_hex for {txid} and regtest fetch failed (embed hex in history)"
             ),
         }
     };
     lab_rgb::bfa::audit_history(&hist, &fetch)
+}
+
+/// Public BFA audit is compute-only and offline: every mint must carry its
+/// witness transaction. This prevents an untrusted request from spawning the
+/// local regtest helper while allowing self-contained histories to be checked.
+pub(crate) fn handle_bfa_audit_post_public(body: &str) -> Result<lab_rgb::bfa::BfaAuditResult> {
+    let hist: lab_rgb::bfa::BfaHistory = serde_json::from_str(body).context("BFA history JSON")?;
+    anyhow::ensure!(
+        hist.mints.iter().all(|m| m
+            .witness_tx_hex
+            .as_deref()
+            .is_some_and(|hex| !hex.is_empty())),
+        "public audit requires embedded witness_tx_hex for every mint"
+    );
+    let no_network = |_txid: &str| -> Result<String> {
+        anyhow::bail!("public audit does not fetch witness transactions")
+    };
+    lab_rgb::bfa::audit_history(&hist, &no_network)
 }

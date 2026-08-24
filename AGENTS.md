@@ -50,9 +50,14 @@ Full contract: [docs/PROJECT_MEMORY.md](docs/PROJECT_MEMORY.md) · protocol: [do
 
 ## T1 demo swaps — invariants (do not regress)
 
-`POST /v1/demo/swap` is the **only** endpoint an unauthenticated visitor may use
-to cause a state change, and only when `LABD_DEMO_SWAPS=1` (off by default).
+`POST /v1/demo/swap` and `POST /v1/demo/rgb/run` are the **only** endpoints an
+unauthenticated visitor may use to cause a state change, and only when their
+independent flags are enabled (both off by default).
 Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
+
+- The RGB demo accepts only `turnstile_token`, requires action
+  `rgbmvp_rgb_lab`, fixes `bob → alice` and every chain/asset/amount/broadcast
+  parameter server-side, and uses a quota ledger separate from T1.
 
 - The demo endpoint accepts **only** a bot-check token. Amounts, fees, CSV delay,
   wallet names, and `rgb_wrap=false` are server-fixed — never read them from the

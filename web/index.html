@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>rgbmvp — RGB on Liquid testnet lab</title>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f2f4ee; background: #080b0a; --ink:#f2f4ee; --muted:#a5aea3; --line:#303a32; --surface:#111713; --surface-2:#171e19; --accent:#b7ff3c; --teal:#22e1c9; --amber:#ffc857; --bad:#ff7b7b; }
     * { box-sizing: border-box; }
@@ -168,6 +169,8 @@
     body.public-readonly .panel { display: none !important; }
     body.public-readonly #public-evidence-only { display: block; }
     #public-evidence-only { display: none; }
+    body.public-readonly #public-rgb-lab { display: block; }
+    #public-rgb-lab { display: none; }
   </style>
 </head>
 <body>
@@ -240,11 +243,12 @@
   </div>
 
   <div id="public-banner" class="public-banner" role="status">
-    <strong>Public read-only surface — with one exception.</strong>
-    This host serves evidence and GET <code>/v1</code>. Issue, Transfer, and the operator Swap
-    wizard all return 403. The single public action is the bounded
-    <a href="/swap">demo swap</a>, which runs a real testnet HTLC between the lab's own wallets
-    under fixed amounts and quotas — and only where it has been explicitly enabled.
+    <strong>Public fixed-flow surface.</strong>
+    Arbitrary Issue, Transfer, Verify, and operator Swap requests remain Bearer-token protected.
+    This page can expose one complete, Turnstile-gated RGB workflow between predefined testnet
+    wallets, with server-fixed parameters and an independent quota. BFA audit remains a
+    compute-only POST with embedded witnesses. The separately bounded
+    <a href="/swap">demo swap</a> runs a testnet HTLC under its own quotas where enabled.
     Full operator lab (wallets, fund/claim) runs on localhost — see
     <a href="https://github.com/EdwinKestler/rgbmvp/blob/main/docs/PUBLIC_LAUNCH.md">PUBLIC_LAUNCH.md</a>
     and <a href="https://github.com/EdwinKestler/rgbmvp/blob/main/docs/S3_RGB_WRAP.md">S3 runbook</a>.
@@ -252,16 +256,29 @@
   </div>
 
   <div id="public-evidence-only" class="card">
-    <h2>Evidence-only console</h2>
-    <p class="muted">Operator tabs are hidden on public deployments. Use these surfaces:</p>
+    <h2>Public console</h2>
+    <p class="muted">Arbitrary operator tabs are hidden on public deployments. Use these bounded surfaces:</p>
     <ul class="muted">
       <li><a href="/status">/status</a> — scenario proofs &amp; manifest</li>
       <li><a href="/demo">/demo</a> — board (read-only)</li>
       <li><a href="/swap">/swap</a> — bounded live demo swap (when enabled)</li>
-      <li><a href="/audit">/audit</a> — BFA samples (load/copy; server audit is local-only)</li>
+      <li><a href="/audit">/audit</a> — run self-contained BFA history checks (no keys or chain RPC)</li>
       <li><a href="/v1">/v1</a> · <a href="/v1/security">/v1/security</a> · <a href="/v1/health">/v1/health</a></li>
     </ul>
   </div>
+
+  <section id="public-rgb-lab" class="card" aria-labelledby="public-rgb-title">
+    <div class="eyebrow">Anonymous testnet lab</div>
+    <h2 id="public-rgb-title">Issue → Transfer → Verify</h2>
+    <p class="muted">Run one complete RGB-on-Liquid workflow between the predefined
+      <strong>bob</strong> sender and <strong>alice</strong> receiver. The asset, amount,
+      fees, addresses, chain, and broadcast choice are fixed by the server.</p>
+    <div id="rgb-demo-parameters" class="muted">Loading fixed parameters and quota…</div>
+    <div id="rgb-demo-turnstile" style="margin:1rem 0"></div>
+    <button type="button" id="rgb-demo-run" disabled>Run Issue → Transfer → Verify</button>
+    <div id="rgb-demo-status" class="muted" role="status" aria-live="polite" style="margin-top:.75rem"></div>
+    <pre id="rgb-demo-output"></pre>
+  </section>
 
   <div class="tabs" role="tablist" aria-label="Lab workflow">
     <button type="button" role="tab" aria-selected="true" aria-controls="panel-issue" class="secondary active" data-tab="issue">Issue</button>
@@ -452,7 +469,72 @@
       });
     });
 
-    /** Public Cloud Run: hide operator mutations when LABD_PUBLIC_READ_ONLY. */
+    let rgbDemoWidgetId = null;
+    let rgbDemoToken = '';
+
+    async function setupPublicRgbDemo() {
+      const status = $('rgb-demo-status');
+      const button = $('rgb-demo-run');
+      try {
+        const r = await fetch('/v1/demo/rgb/quota');
+        const q = await r.json();
+        const p = q.parameters || {};
+        const asset = p.asset || {};
+        $('rgb-demo-parameters').innerHTML =
+          `<strong>${esc(p.sender_wallet || 'bob')} → ${esc(p.receiver_wallet || 'alice')}</strong> · ` +
+          `${esc(p.network || 'liquid-testnet')} · ${esc(asset.ticker || 'SLAB')} · ` +
+          `transfer ${esc(p.transfer_amount || 100000)} units · ` +
+          `${esc((q.usage || {}).runs_today || 0)}/${esc((q.limits || {}).daily_cap || 0)} runs today`;
+        if (!q.enabled) {
+          status.textContent = 'The anonymous RGB flow is currently disabled.';
+          return;
+        }
+        if (!q.turnstile_sitekey || !window.turnstile) {
+          status.textContent = 'Bot check unavailable; the flow remains fail-closed.';
+          return;
+        }
+        window.turnstile.ready(() => {
+          if (rgbDemoWidgetId !== null) return;
+          rgbDemoWidgetId = window.turnstile.render('#rgb-demo-turnstile', {
+            sitekey: q.turnstile_sitekey,
+            action: q.turnstile_action || 'rgbmvp_rgb_lab',
+            callback: token => { rgbDemoToken = token; button.disabled = false; status.textContent = 'Bot check complete. Ready to run.'; },
+            'expired-callback': () => { rgbDemoToken = ''; button.disabled = true; },
+            'error-callback': () => { rgbDemoToken = ''; button.disabled = true; status.textContent = 'Bot check failed; retry the widget.'; }
+          });
+        });
+      } catch (error) {
+        status.textContent = 'RGB demo status unavailable: ' + error;
+      }
+    }
+
+    $('rgb-demo-run').onclick = async () => {
+      const button = $('rgb-demo-run');
+      const status = $('rgb-demo-status');
+      if (!rgbDemoToken) return;
+      button.disabled = true;
+      status.textContent = 'Issuing, broadcasting the fixed transfer, and verifying its witness…';
+      $('rgb-demo-output').textContent = '';
+      try {
+        const r = await fetch('/v1/demo/rgb/run', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({turnstile_token: rgbDemoToken})
+        });
+        const j = await r.json();
+        $('rgb-demo-output').textContent = JSON.stringify(j, null, 2);
+        if (!r.ok) throw new Error(j.error || j.message || r.statusText);
+        const link = j.explorer_url ? ` · <a href="${safeUrl(j.explorer_url)}" target="_blank" rel="noopener noreferrer">explorer ↗</a>` : '';
+        status.innerHTML = `<span class="ok">Complete</span> · contract <code>${esc(j.contract_id)}</code> · proof <code>${esc(j.proof_id)}</code>${link}`;
+      } catch (error) {
+        status.innerHTML = `<span class="bad">Run failed:</span> ${esc(error)}`;
+      } finally {
+        rgbDemoToken = '';
+        if (window.turnstile && rgbDemoWidgetId !== null) window.turnstile.reset(rgbDemoWidgetId);
+      }
+    };
+
+    /** Public Cloud Run: hide arbitrary operator mutations when LABD_PUBLIC_READ_ONLY. */
     let publicReadOnly = false;
     async function applySecurityPresentation() {
       try {
@@ -461,7 +543,7 @@
         publicReadOnly = !!j.public_read_only;
         if ($('security-line')) {
           $('security-line').innerHTML = publicReadOnly
-            ? 'Security: <span class="ok">public_read_only</span> · mutations require Bearer (disabled on this host)'
+            ? 'Security: <span class="ok">public fixed-flow mode</span> · arbitrary mutations require Bearer'
             : 'Security: operator/loopback · mutations allowed on this bind';
         }
         const ban = $('public-banner');
@@ -469,7 +551,8 @@
           document.body.classList.add('public-readonly');
           if (ban) ban.classList.add('show');
           const badge = document.querySelector('.network-badge');
-          if (badge) badge.textContent = 'PUBLIC · READ-ONLY';
+          if (badge) badge.textContent = 'PUBLIC · FIXED FLOWS';
+          await setupPublicRgbDemo();
         } else {
           document.body.classList.remove('public-readonly');
           if (ban) ban.classList.remove('show');

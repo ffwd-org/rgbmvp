@@ -20,8 +20,9 @@ U4 is **ops/security**, not new RGB math. P3 stays closed as a localhost console
 
 | Control | Behavior |
 |---------|----------|
-| **Public surface** | Static pages + `GET /v1/*` catalog, health, phases, networks, security, proofs, swaps (preimage redacted), plans, demo board APIs |
-| **Mutations** | `POST` requires `Authorization: Bearer <LABD_API_TOKEN>` when `LABD_PUBLIC_READ_ONLY=1`, or when bind is **non-loopback** |
+| **Public surface** | Static pages + safe `GET /v1/*`; compute-only `POST /v1/audit/bfa`; optionally exact fixed demo paths `/v1/demo/swap` and `/v1/demo/rgb/run` |
+| **Mutations** | Arbitrary `POST` requires `Authorization: Bearer <LABD_API_TOKEN>` in public mode. Exact demo paths are independently flag-gated and enforce Turnstile, fixed parameters, quotas, float floors, and separate durable budgets |
+| **BFA audit** | Exact `POST /v1/audit/bfa` is non-mutating; public mode requires `witness_tx_hex` on every mint and never invokes RPC or a subprocess |
 | **Loopback operator** | `127.0.0.1` + no token → mutations allowed (dev default) |
 | **CORS** | Allowlist via `LABD_CORS_ORIGINS`; **no `*`** in public read-only mode |
 | **Body limit** | `LABD_MAX_BODY_BYTES` (default 65536) |

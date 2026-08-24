@@ -4,8 +4,8 @@
 //! U4: public-hosting security helpers (`security` module).
 //! T1: bounded public demo-swap policy and budget governor (`demo` module).
 
-pub mod demo;
 pub mod custody;
+pub mod demo;
 pub mod security;
 
 use std::env;
@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub use demo::{DemoDenial, DemoGovernor, DemoStatus, DemoSwapPolicy, Floats};
 pub use custody::{
     resolve_mounted_secret_path, resolve_secret_path, secret_dirs, CustodyCheck, CustodyIssue,
-    DEMO_EXIT_SECRET_NAME, KIND_EXIT_SEED, KIND_MNEMONIC, KIND_WIF,
+    DEMO_EXIT_SECRET_NAME, KIND_DESCRIPTOR, KIND_EXIT_SEED, KIND_MNEMONIC, KIND_WIF,
 };
+pub use demo::{DemoDenial, DemoGovernor, DemoStatus, DemoSwapPolicy, Floats};
 pub use security::{
     constant_time_eq, cors_allow_origin, is_loopback_bind, is_mutation_method, is_safe_path_id,
     parse_cors_origins, validate_path_id, AuthDecision, MutationPolicy, RateLimiter,
@@ -95,9 +95,8 @@ impl Config {
                 bail!("mainnet is forbidden in lab config (got RGBMVP_NETWORK={n:?})");
             }
         }
-        let data_dir = PathBuf::from(
-            env::var("RGBMVP_DATA_DIR").unwrap_or_else(|_| ".rgbmvp".to_string()),
-        );
+        let data_dir =
+            PathBuf::from(env::var("RGBMVP_DATA_DIR").unwrap_or_else(|_| ".rgbmvp".to_string()));
         let wallet_dir = env::var("RGBMVP_WALLET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_dir.join("wallets"));
@@ -164,11 +163,9 @@ impl Config {
         let sdirs = secret_dirs();
         let fallback = self.wallet_dir.join(DEMO_EXIT_SECRET_NAME);
         if !sdirs.is_empty() {
-            if let Some(path) = resolve_mounted_secret_path(
-                &sdirs,
-                DEMO_EXIT_SECRET_NAME,
-                KIND_EXIT_SEED,
-            ) {
+            if let Some(path) =
+                resolve_mounted_secret_path(&sdirs, DEMO_EXIT_SECRET_NAME, KIND_EXIT_SEED)
+            {
                 return Ok(path);
             }
             bail!(
@@ -177,12 +174,9 @@ impl Config {
                 KIND_EXIT_SEED
             );
         }
-        if let Some(path) = resolve_secret_path(
-            &[],
-            &fallback,
-            DEMO_EXIT_SECRET_NAME,
-            KIND_EXIT_SEED,
-        ) {
+        if let Some(path) =
+            resolve_secret_path(&[], &fallback, DEMO_EXIT_SECRET_NAME, KIND_EXIT_SEED)
+        {
             return Ok(path);
         }
 
@@ -190,8 +184,7 @@ impl Config {
             .with_context(|| format!("create demo exit secret dir {}", fallback.display()))?;
         let path = fallback.join(KIND_EXIT_SEED);
         let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed)
-            .map_err(|e| anyhow::anyhow!("generate demo exit seed: {e}"))?;
+        getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("generate demo exit seed: {e}"))?;
         let encoded = format!("{}\n", hex::encode(seed));
 
         #[cfg(unix)]
@@ -305,8 +298,7 @@ pub fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
 }
 
 pub fn read_trimmed(path: &Path) -> Result<String> {
-    let s = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     Ok(s.trim().to_string())
 }
 

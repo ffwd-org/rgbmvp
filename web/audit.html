@@ -41,10 +41,9 @@
   <div class="eyebrow">C3 · Backed fungible assets</div><h1>Audit the full history, not a promise.</h1>
   <p class="lede">Load a canned sample (or paste your own BFA history JSON). The lab checks seals, anchors, and backing without an oracle.</p>
   <div id="public-banner" class="public-banner" role="status">
-    <strong>Public read-only host.</strong>
-    Sample load, copy, and download stay available. Server-side <code>POST /v1/audit/bfa</code> is blocked
-    (<code>public_read_only</code>). Run audit locally:
-    <code>rgbmvp bfa audit --history …</code> or a loopback <code>labd</code> without <code>LABD_PUBLIC_READ_ONLY</code>.
+    <strong>Public compute-only audit.</strong>
+    <code>POST /v1/audit/bfa</code> accepts self-contained histories whose mints
+    include <code>witness_tx_hex</code>. It performs no signing, chain RPC, or state change.
   </div>
   <div class="banner">
     Samples include embedded <code>witness_tx_hex</code> from the C3 regtest demo — no live chain required to run the three proof cases.
@@ -87,15 +86,13 @@
     function applyPublicAuditUi() {
       const go = $('go');
       if (go) {
-        go.disabled = publicReadOnly;
-        go.title = publicReadOnly
-          ? 'POST /v1/audit/bfa blocked on public_read_only hosts — run rgbmvp bfa audit locally'
-          : 'POST /v1/audit/bfa';
-        if (publicReadOnly) go.textContent = 'Run audit (local only)';
+        go.disabled = false;
+        go.title = 'POST /v1/audit/bfa · compute-only; embedded witnesses required on public hosts';
+        go.textContent = 'Run audit';
       }
       document.querySelectorAll('[data-audit-run]').forEach((btn) => {
-        btn.disabled = publicReadOnly;
-        btn.title = publicReadOnly ? 'Server audit disabled on public_read_only host' : '';
+        btn.disabled = false;
+        btn.title = 'Run the self-contained history audit';
       });
       const ban = $('public-banner');
       if (ban) {
@@ -129,9 +126,7 @@
         } catch (_) {
           setBody(text);
         }
-        const nextHint = publicReadOnly
-          ? ' · copy/download, then audit with local CLI'
-          : ' · click <strong>Run audit</strong>';
+        const nextHint = ' · click <strong>Run audit</strong>';
         $('summary').innerHTML = '<span class="muted">Loaded <code>' + esc(url) + '</code>'
           + (expect ? ' · expect <span class="chip ' + (expect === 'ok' ? 'ok' : 'fail') + '">' + esc(expect) + '</span>' : '')
           + nextHint + '</span>';
@@ -150,9 +145,7 @@
         if (!r.ok) throw new Error(j.error || r.statusText);
         const list = j.samples || [];
         $('samples-status').textContent = list.length
-          ? (publicReadOnly
-            ? 'Pick a case to load/copy (static fixtures). Server Run audit is off on this host.'
-            : 'Pick a case (static fixtures under artifacts/public/bfa/).')
+          ? 'Pick a case (self-contained fixtures under artifacts/public/bfa/).'
           : 'No samples listed.';
         host.innerHTML = '';
         list.forEach((s) => {
@@ -173,10 +166,9 @@
           loadRun.type = 'button';
           loadRun.className = 'row-btn secondary';
           loadRun.setAttribute('data-audit-run', '1');
-          loadRun.textContent = publicReadOnly ? 'Load + audit (local only)' : 'Load + audit';
-          loadRun.disabled = publicReadOnly;
+          loadRun.textContent = 'Load + audit';
+          loadRun.disabled = false;
           loadRun.onclick = async () => {
-            if (publicReadOnly) return;
             await loadSample(s.url || ('/artifacts/public/' + s.path), expect);
             await runAudit();
           };
@@ -202,10 +194,6 @@
     }
 
     async function runAudit() {
-      if (publicReadOnly) {
-        $('summary').innerHTML = '<span class="bad">Server audit disabled on public_read_only hosts. Copy JSON and run <code>rgbmvp bfa audit --history …</code> locally.</span>';
-        return;
-      }
       const text = $('body').value.trim();
       if (!text) {
         $('summary').innerHTML = '<span class="bad">Paste or load a history JSON first.</span>';

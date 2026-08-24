@@ -16,13 +16,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use lab_core::{
-    cors_allow_origin, is_loopback_bind, is_mutation_method, validate_path_id, AuthDecision, Config,
-    DemoGovernor, RateLimiter,
+    cors_allow_origin, is_loopback_bind, is_mutation_method, validate_path_id, AuthDecision,
+    Config, DemoGovernor, RateLimiter,
 };
 
-use crate::demo_swap::{
-    self, quota_json, BotCheck, DemoFees, DemoWallets, FloatCache,
-};
+use crate::demo_swap::{self, quota_json, BotCheck, DemoFees, DemoWallets, FloatCache};
 use lab_rgb::storage::RgbStore;
 use lab_rgb::swap::SwapStore;
 use serde_json::{json, Value};
@@ -30,9 +28,9 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
 use crate::http_api::{
-    demo_activity, demo_wallets, handle_bfa_audit_post, handle_rgb_issue_post,
-    handle_rgb_transfer_post, handle_swap_action_post, handle_swap_init_post, handle_verify_post,
-    list_rgb_contracts, list_swap_ids, public_swap_view,
+    demo_activity, demo_wallets, handle_bfa_audit_post, handle_bfa_audit_post_public,
+    handle_rgb_issue_post, handle_rgb_transfer_post, handle_swap_action_post,
+    handle_swap_init_post, handle_verify_post, list_rgb_contracts, list_swap_ids, public_swap_view,
 };
 
 #[derive(Clone)]
@@ -43,6 +41,8 @@ struct AppState {
     verify_limiter: Arc<RateLimiter>,
     /// T1 bounded public demo swaps: admission + spend governor (off by default).
     demo: Arc<DemoGovernor>,
+    /// Anonymous fixed-parameter RGB lab, with an independent durable budget.
+    rgb_demo: Arc<DemoGovernor>,
     demo_floats: Arc<FloatCache>,
     demo_wallets: DemoWallets,
     demo_fees: DemoFees,
@@ -84,6 +84,7 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         std::env::var("LABD_ARTIFACTS_DIR").unwrap_or_else(|_| "artifacts/public".into()),
     );
     let demo = Arc::new(DemoGovernor::from_env());
+    let rgb_demo = Arc::new(DemoGovernor::new(crate::rgb_demo::policy_from_env()));
     let client_ip_policy =
         ClientIpPolicy::from_env().context("invalid client-IP proxy trust configuration")?;
     if demo.enabled() {
@@ -139,7 +140,10 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
                 if d.is_empty() {
                     "(local wallet dir)".to_string()
                 } else {
-                    d.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":")
+                    d.iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(":")
                 }
             },
             public
@@ -148,12 +152,44 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         demo_swap::restore_budget(&cfg, &demo)
             .context("demo swaps refused to start (W4 budget recovery)")?;
     }
+    if rgb_demo.enabled() {
+        let public = !is_loopback_bind(&bind) || sec.public_read_only;
+        demo_swap::validate_turnstile_config()
+            .context("RGB demo refused: Turnstile context is not fail-closed")?;
+        let required = vec![
+            (
+                crate::rgb_demo::SENDER_WALLET.to_string(),
+                lab_core::KIND_MNEMONIC.to_string(),
+            ),
+            (
+                crate::rgb_demo::SENDER_WALLET.to_string(),
+                lab_core::KIND_DESCRIPTOR.to_string(),
+            ),
+        ];
+        let issues = lab_core::custody::preflight(&lab_core::CustodyCheck {
+            required: &required,
+            wallet_dir: &cfg.wallet_dir,
+            public,
+        });
+        lab_core::custody::enforce(&issues)
+            .context("RGB demo refused to start (custody preflight)")?;
+        demo_swap::restore_named_budget(&cfg, &rgb_demo, crate::rgb_demo::BUDGET_NAME, "RGB demo")
+            .context("RGB demo refused to start (budget recovery)")?;
+        eprintln!(
+            "  RGB demo: ENABLED fixed {} -> {}, daily={} budget={}sats",
+            crate::rgb_demo::SENDER_WALLET,
+            crate::rgb_demo::RECEIVER_WALLET,
+            rgb_demo.policy().daily_cap,
+            rgb_demo.policy().fee_budget_sats
+        );
+    }
     let state = AppState {
         cfg: cfg.clone(),
         web_dir,
         artifacts_dir,
         verify_limiter: Arc::new(RateLimiter::from_env_verify()),
         demo,
+        rgb_demo,
         demo_floats: Arc::new(FloatCache::new()),
         demo_wallets: DemoWallets::from_env(),
         demo_fees: DemoFees::from_env(),
@@ -173,8 +209,7 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
             "  T1 refund watcher: every {interval_secs}s, sweeping swaps older than {min_age_secs}s"
         );
         tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             // The first tick fires immediately; skip it so startup stays quiet.
             tick.tick().await;
             loop {
@@ -257,10 +292,11 @@ fn router(state: AppState) -> Router {
         // Turnstile + quota + budget gate and accepts no protocol parameters.
         .route("/v1/demo/swap", post(v1_demo_swap))
         .route("/v1/demo/quota", get(v1_demo_quota))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            u4_middleware,
-        ))
+        // Fixed anonymous RGB lab. The POST accepts only a Turnstile token;
+        // every chain and asset parameter is selected server-side.
+        .route("/v1/demo/rgb/run", post(v1_demo_rgb_run))
+        .route("/v1/demo/rgb/quota", get(v1_demo_rgb_quota))
+        .layer(middleware::from_fn_with_state(state.clone(), u4_middleware))
         .with_state(state)
 }
 
@@ -302,13 +338,17 @@ async fn u4_middleware(
         );
     }
 
-    // The bounded demo-swap trigger is the ONLY public mutation. It is exempt
-    // from the Bearer-token requirement, but only on an exact path match and
-    // only while the demo flag is on; its own gate (Turnstile + per-IP quota +
-    // daily cap + fee budget + float floors) runs inside the handler.
+    // Public mutations are an explicit exact-path allowlist. Each exemption is
+    // independently flag-gated and performs Turnstile, quota, durable budget,
+    // and float admission inside its handler.
     let demo_exempt = state.demo.enabled() && path == "/v1/demo/swap";
+    let rgb_demo_exempt = state.rgb_demo.enabled() && path == "/v1/demo/rgb/run";
+    // BFA audit is a bounded, compute-only operation. Public mode additionally
+    // requires embedded witnesses, so it performs no RPC, filesystem write, or
+    // subprocess invocation and is not a mutation despite using POST.
+    let public_audit = path == "/v1/audit/bfa";
 
-    if is_mutation_method(method.as_str()) && !demo_exempt {
+    if is_mutation_method(method.as_str()) && !demo_exempt && !rgb_demo_exempt && !public_audit {
         let auth = req
             .headers()
             .get(header::AUTHORIZATION)
@@ -322,7 +362,11 @@ async fn u4_middleware(
             } => {
                 let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
                 let body = json!({"error": message, "status": "error", "code": code});
-                return finalize_response(cors_json(sc, acao.as_deref(), body), &path, acao.as_deref());
+                return finalize_response(
+                    cors_json(sc, acao.as_deref(), body),
+                    &path,
+                    acao.as_deref(),
+                );
             }
         }
     }
@@ -924,14 +968,12 @@ async fn v1_demo_swap(
 
     // Bot check first: cheapest rejection, and it must gate the chain reads.
     if s.demo.policy().turnstile_required {
-        let token = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v.get("turnstile_token")
-                    .or_else(|| v.get("token"))
-                    .and_then(|t| t.as_str())
-                    .map(|t| t.to_string())
-            });
+        let token = serde_json::from_slice::<Value>(&body).ok().and_then(|v| {
+            v.get("turnstile_token")
+                .or_else(|| v.get("token"))
+                .and_then(|t| t.as_str())
+                .map(|t| t.to_string())
+        });
         let ip_for_check = ip.clone();
         let check = tokio::task::spawn_blocking(move || {
             demo_swap::verify_turnstile_blocking(token.as_deref(), Some(&ip_for_check))
@@ -940,12 +982,8 @@ async fn v1_demo_swap(
         .unwrap_or(BotCheck::Failed);
         match check {
             BotCheck::Pass => {}
-            BotCheck::Missing => {
-                return demo_denial_response(&DemoDenial::TurnstileRequired)
-            }
-            BotCheck::Failed => {
-                return demo_denial_response(&DemoDenial::TurnstileFailed)
-            }
+            BotCheck::Missing => return demo_denial_response(&DemoDenial::TurnstileRequired),
+            BotCheck::Failed => return demo_denial_response(&DemoDenial::TurnstileFailed),
         }
     }
 
@@ -953,11 +991,9 @@ async fn v1_demo_swap(
     let cfg = s.cfg.clone();
     let wallets = s.demo_wallets.clone();
     let floats_cache = s.demo_floats.clone();
-    let floats = tokio::task::spawn_blocking(move || {
-        floats_cache.observe_blocking(&cfg, &wallets)
-    })
-    .await
-    .unwrap_or(None);
+    let floats = tokio::task::spawn_blocking(move || floats_cache.observe_blocking(&cfg, &wallets))
+        .await
+        .unwrap_or(None);
 
     // Admission: quotas, daily cap, concurrency, cooldown, budget, floors.
     if let Err(d) = s.demo.try_admit(&ip, demo_swap::now_epoch(), floats) {
@@ -969,10 +1005,9 @@ async fn v1_demo_swap(
     // unavailable, release only the unspent in-memory reservation and refuse.
     let persist_cfg = s.cfg.clone();
     let persist_gov = s.demo.clone();
-    let persisted = tokio::task::spawn_blocking(move || {
-        demo_swap::persist_budget(&persist_cfg, &persist_gov)
-    })
-    .await;
+    let persisted =
+        tokio::task::spawn_blocking(move || demo_swap::persist_budget(&persist_cfg, &persist_gov))
+            .await;
     match persisted {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -1058,9 +1093,160 @@ async fn v1_demo_quota(State(s): State<AppState>) -> Response {
     Json(quota_json(&s.demo, floats)).into_response()
 }
 
-async fn v1_audit_bfa(body: bytes::Bytes) -> Response {
+/// `POST /v1/demo/rgb/run` — anonymous, fixed Issue -> Transfer -> Verify.
+async fn v1_demo_rgb_run(
+    State(s): State<AppState>,
+    axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
+    body: bytes::Bytes,
+) -> Response {
+    use lab_core::DemoDenial;
+
+    if !s.rgb_demo.enabled() {
+        return demo_denial_response(&DemoDenial::Disabled);
+    }
+
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        _ => {
+            return err_code(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "JSON object required",
+            )
+        }
+    };
+    let Some(fields) = parsed.as_object() else {
+        return err_code(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "JSON object required",
+        );
+    };
+    if fields.keys().any(|key| key != "turnstile_token") {
+        return err_code(
+            StatusCode::BAD_REQUEST,
+            "fixed_parameters",
+            "only turnstile_token is accepted; wallets and parameters are server-fixed",
+        );
+    }
+    let token = fields
+        .get("turnstile_token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let ip_for_check = ip.clone();
+    let check = tokio::task::spawn_blocking(move || {
+        demo_swap::verify_turnstile_action_blocking(
+            token.as_deref(),
+            Some(&ip_for_check),
+            demo_swap::RGB_LAB_TURNSTILE_ACTION,
+        )
+    })
+    .await
+    .unwrap_or(BotCheck::Failed);
+    match check {
+        BotCheck::Pass => {}
+        BotCheck::Missing => return demo_denial_response(&DemoDenial::TurnstileRequired),
+        BotCheck::Failed => return demo_denial_response(&DemoDenial::TurnstileFailed),
+    }
+
+    let float_cfg = s.cfg.clone();
+    let floats = tokio::task::spawn_blocking(move || crate::rgb_demo::observe_floats(&float_cfg))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    if let Err(denial) = s.rgb_demo.try_admit(&ip, demo_swap::now_epoch(), floats) {
+        return demo_denial_response(&denial);
+    }
+
+    // The full cost reservation is durable before issue writes or broadcast.
+    let persist_cfg = s.cfg.clone();
+    let persist_gov = s.rgb_demo.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        demo_swap::persist_named_budget(&persist_cfg, &persist_gov, crate::rgb_demo::BUDGET_NAME)
+    })
+    .await;
+    if !matches!(persisted, Ok(Ok(()))) {
+        s.rgb_demo.abort();
+        return err_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "budget_unavailable",
+            "RGB demo budget could not be reserved",
+        );
+    }
+
+    let run_cfg = s.cfg.clone();
+    let result = tokio::task::spawn_blocking(move || crate::rgb_demo::run(&run_cfg)).await;
+    let response = match result {
+        Ok(Ok(value)) => {
+            // The chain helper does not yet expose an exact fee. Charge the full
+            // conservative reservation rather than under-accounting a run.
+            s.rgb_demo.finish(s.rgb_demo.policy().max_fee_per_swap_sats);
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Ok(Err(error)) => {
+            // A broadcast may already have happened. Unknown outcomes stay
+            // charged and are visible on the board for operator follow-up.
+            s.rgb_demo.fail_closed();
+            err_json(StatusCode::BAD_GATEWAY, error)
+        }
+        Err(error) => {
+            s.rgb_demo.fail_closed();
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, error)
+        }
+    };
+    if let Err(error) =
+        demo_swap::persist_named_budget(&s.cfg, &s.rgb_demo, crate::rgb_demo::BUDGET_NAME)
+    {
+        eprintln!("RGB demo: failed to persist settlement: {error:#}");
+    }
+    response
+}
+
+async fn v1_demo_rgb_quota(State(s): State<AppState>) -> Response {
+    let p = s.rgb_demo.policy();
+    let st = s.rgb_demo.status(demo_swap::now_epoch());
+    Json(json!({
+        "enabled": p.enabled,
+        "turnstile_required": true,
+        "turnstile_sitekey": demo_swap::turnstile_sitekey(),
+        "turnstile_action": demo_swap::RGB_LAB_TURNSTILE_ACTION,
+        "parameters": crate::rgb_demo::fixed_parameters_json(),
+        "limits": {
+            "daily_cap": p.daily_cap,
+            "max_concurrent": p.max_concurrent,
+            "min_interval_secs": p.global_min_interval_secs,
+            "per_ip_hourly": p.per_ip_hourly,
+            "per_ip_daily": p.per_ip_daily
+        },
+        "budget": {
+            "cost_budget_sats": p.fee_budget_sats,
+            "cost_accounted_sats": st.fee_spent_sats
+                .saturating_add(st.fee_reserved_sats)
+                .saturating_add(st.fee_committed_sats),
+            "runs_remaining_est": s.rgb_demo.swaps_remaining_in_budget()
+        },
+        "usage": {
+            "in_flight": st.in_flight,
+            "runs_today": st.swaps_today,
+            "runs_total": st.swaps_total
+        }
+    }))
+    .into_response()
+}
+
+async fn v1_audit_bfa(State(s): State<AppState>, body: bytes::Bytes) -> Response {
     let body = String::from_utf8_lossy(&body).into_owned();
-    match tokio::task::spawn_blocking(move || handle_bfa_audit_post(&body)).await {
+    let public_read_only = s.cfg.security.public_read_only;
+    match tokio::task::spawn_blocking(move || {
+        if public_read_only {
+            handle_bfa_audit_post_public(&body)
+        } else {
+            handle_bfa_audit_post(&body)
+        }
+    })
+    .await
+    {
         Ok(Ok(v)) => {
             let status = if v.ok {
                 StatusCode::OK
@@ -1097,6 +1283,7 @@ mod tests {
             artifacts_dir: PathBuf::from("artifacts/public"),
             verify_limiter: Arc::new(RateLimiter::new(100, std::time::Duration::from_secs(60))),
             demo: Arc::new(DemoGovernor::new(demo_policy)),
+            rgb_demo: Arc::new(DemoGovernor::new(lab_core::DemoSwapPolicy::default())),
             demo_floats: Arc::new(FloatCache::new()),
             demo_wallets: DemoWallets {
                 alice_btc: "btc-alice".into(),
@@ -1130,12 +1317,7 @@ mod tests {
         for path in ["/v1", "/v1/security", "/v1/phases", "/v1/networks"] {
             let res = app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "path {path}");
@@ -1155,6 +1337,57 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/swap/init")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        std::env::remove_var("LABD_PUBLIC_READ_ONLY");
+    }
+
+    #[tokio::test]
+    async fn public_bfa_audit_is_compute_only_and_needs_no_bearer() {
+        std::env::set_var("LABD_PUBLIC_READ_ONLY", "1");
+        std::env::remove_var("LABD_API_TOKEN");
+        let mut cfg = Config::load().expect("config");
+        cfg.security = lab_core::MutationPolicy::from_env(&cfg.labd_bind);
+        let state = state_with(cfg, lab_core::DemoSwapPolicy::default());
+        let app = router(state);
+        let body = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../artifacts/public/bfa/honest.json"),
+        )
+        .expect("public honest BFA fixture");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audit/bfa")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        std::env::remove_var("LABD_PUBLIC_READ_ONLY");
+    }
+
+    #[tokio::test]
+    async fn public_bfa_audit_exemption_is_exact_path_only() {
+        std::env::set_var("LABD_PUBLIC_READ_ONLY", "1");
+        std::env::remove_var("LABD_API_TOKEN");
+        let mut cfg = Config::load().expect("config");
+        cfg.security = lab_core::MutationPolicy::from_env(&cfg.labd_bind);
+        let state = state_with(cfg, lab_core::DemoSwapPolicy::default());
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audit/bfa/extra")
                     .header("content-type", "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -1215,8 +1448,18 @@ mod tests {
                 "{path} should render the real page, not the fallback"
             );
             // Disclaimers are the point of the page; keep them non-optional.
-            assert!(html.contains("testnet only"), "{path} must state testnet-only");
-            for bad in ["preimage_hex", "mnemonic", "wif", "xprv", "tprv", "secret_dir"] {
+            assert!(
+                html.contains("testnet only"),
+                "{path} must state testnet-only"
+            );
+            for bad in [
+                "preimage_hex",
+                "mnemonic",
+                "wif",
+                "xprv",
+                "tprv",
+                "secret_dir",
+            ] {
                 assert!(!html.contains(bad), "{path} must not contain {bad}");
             }
             // The page must drive the bounded endpoint, never the arbitrary one.
@@ -1258,6 +1501,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn public_rgb_card_uses_only_the_fixed_demo_endpoint() {
+        let mut state = test_state();
+        state.web_dir = repo_web_dir();
+        let app = router(state);
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        let start = html.find("id=\"public-rgb-lab\"").expect("public RGB card");
+        let end = html[start..]
+            .find("<div class=\"tabs\"")
+            .map(|offset| start + offset)
+            .expect("operator tabs after public card");
+        let card = &html[start..end];
+        assert!(card.contains("Issue → Transfer → Verify"));
+        assert!(!card.contains("<input") && !card.contains("<select"));
+        assert!(html.contains("/v1/demo/rgb/run"));
+        assert!(html.contains("rgbmvp_rgb_lab"));
+    }
+
     /// The demo exemption must be an EXACT path match — no prefix escape.
     #[tokio::test]
     async fn demo_exemption_does_not_leak_to_other_mutations() {
@@ -1293,6 +1562,56 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "{path} must stay token-gated even with demo swaps enabled"
             );
+        }
+        std::env::remove_var("LABD_PUBLIC_READ_ONLY");
+    }
+
+    #[tokio::test]
+    async fn rgb_demo_exemption_is_exact_and_parameters_are_rejected() {
+        std::env::set_var("LABD_PUBLIC_READ_ONLY", "1");
+        std::env::remove_var("LABD_API_TOKEN");
+        let mut cfg = Config::load().expect("config");
+        cfg.security = lab_core::MutationPolicy::from_env(&cfg.labd_bind);
+        let mut state = state_with(cfg, lab_core::DemoSwapPolicy::default());
+        state.rgb_demo = Arc::new(DemoGovernor::new(lab_core::DemoSwapPolicy {
+            enabled: true,
+            ..Default::default()
+        }));
+        let app = router(state);
+
+        let extra = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/demo/rgb/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"turnstile_token":"x","amount":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(extra.status(), StatusCode::BAD_REQUEST);
+
+        for path in [
+            "/v1/demo/rgb/run/extra",
+            "/v1/rgb/issue",
+            "/v1/rgb/transfer",
+            "/v1/rgb/verify",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}");
         }
         std::env::remove_var("LABD_PUBLIC_READ_ONLY");
     }
@@ -1494,7 +1813,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let h = res.headers();
         assert_eq!(
-            h.get(header::X_CONTENT_TYPE_OPTIONS).and_then(|v| v.to_str().ok()),
+            h.get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
             Some("nosniff")
         );
         assert_eq!(
@@ -1512,7 +1832,9 @@ mod tests {
         assert!(csp.contains("default-src 'self'"), "csp={csp}");
         // W9.1: Turnstile needs exactly this origin in script-src AND frame-src.
         assert!(
-            csp.contains(&format!("script-src 'self' 'unsafe-inline' {TURNSTILE_ORIGIN}")),
+            csp.contains(&format!(
+                "script-src 'self' 'unsafe-inline' {TURNSTILE_ORIGIN}"
+            )),
             "turnstile script origin must be allowed: csp={csp}"
         );
         assert!(
@@ -1521,7 +1843,10 @@ mod tests {
         );
         // The relaxation is script/frame only — the page must never be able to
         // call out to a third party directly.
-        assert!(csp.contains("connect-src 'self';"), "connect-src must stay self: csp={csp}");
+        assert!(
+            csp.contains("connect-src 'self';"),
+            "connect-src must stay self: csp={csp}"
+        );
         assert!(csp.contains("frame-ancestors 'none'"), "csp={csp}");
         assert_eq!(
             h.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),

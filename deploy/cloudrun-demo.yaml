@@ -7,7 +7,7 @@
 #   freeze (cloudrun.yaml)          demo (this file)
 #   ----------------------          ----------------
 #   LABD_PUBLIC_READ_ONLY=1         LABD_PUBLIC_READ_ONLY=1  (unchanged)
-#   no LABD_DEMO_SWAPS              LABD_DEMO_SWAPS=1        <-- the only public mutation
+#   no demo mutations               fixed T1 swap + RGB lab exact paths
 #   no secrets                      Secret Manager volume at /secrets (read-only)
 #   no volumes                      persistent GCS volume at /data  (budget + sessions)
 #   min 0 / max 1                   min 1 / max 1            <-- refund watcher must keep running
@@ -22,7 +22,7 @@
 #
 # Prerequisites (see deploy/README.md "T1 demo swap deployment"):
 #   - Secret Manager: rgbmvp-demo-btc-alice-wif, rgbmvp-demo-bob-mnemonic,
-#     rgbmvp-demo-exit-seed
+#     rgbmvp-demo-bob-descriptor, rgbmvp-demo-exit-seed
 #   - GCS bucket for the persistent volume (versioning ON)
 #   - Turnstile secret: rgbmvp-demo-turnstile-secret
 #   - Runtime SA rgbmvp-demo-run@PROJECT.iam.gserviceaccount.com
@@ -72,6 +72,13 @@ spec:
               - key: latest
                 path: bob/mnemonic
                 mode: 0400
+        - name: wallet-descriptor-lq
+          secret:
+            secretName: rgbmvp-demo-bob-descriptor
+            items:
+              - key: latest
+                path: bob/descriptor
+                mode: 0400
         - name: demo-exit-seed
           secret:
             secretName: rgbmvp-demo-exit-seed
@@ -97,6 +104,9 @@ spec:
               readOnly: true
             - name: wallet-secrets-lq
               mountPath: /secrets-lq
+              readOnly: true
+            - name: wallet-descriptor-lq
+              mountPath: /secrets-lq-descriptor
               readOnly: true
             - name: demo-exit-seed
               mountPath: /secrets-exits
@@ -125,7 +135,7 @@ spec:
             # Colon-separated: Cloud Run gives each Secret Manager entry its own
             # volume/mountPath, so one directory cannot hold both keys. ---
             - name: RGBMVP_SECRET_DIR
-              value: /secrets:/secrets-lq:/secrets-exits
+              value: /secrets:/secrets-lq:/secrets-lq-descriptor:/secrets-exits
             # --- T1: the bounded public trigger ---
             - name: LABD_DEMO_SWAPS
               value: "1"
@@ -144,6 +154,25 @@ spec:
                 secretKeyRef:
                   name: rgbmvp-demo-turnstile-secret
                   key: latest
+            # --- Anonymous RGB lab: one fixed Issue -> Transfer -> Verify run.
+            # Uses the same widget and secret but requires action=rgbmvp_rgb_lab.
+            # Its quota ledger is /data/rgb_demo_budget.json, independent of T1. ---
+            - name: LABD_RGB_DEMO
+              value: "1"
+            - name: LABD_RGB_DEMO_MAX_COST_SATS
+              value: "2500"
+            - name: LABD_RGB_DEMO_BUDGET_SATS
+              value: "25000"
+            - name: LABD_RGB_DEMO_DAILY_CAP
+              value: "2"
+            - name: LABD_RGB_DEMO_MIN_INTERVAL_SECS
+              value: "600"
+            - name: LABD_RGB_DEMO_PER_IP_HOURLY
+              value: "1"
+            - name: LABD_RGB_DEMO_PER_IP_DAILY
+              value: "1"
+            - name: LABD_RGB_DEMO_LQ_FLOOR_SATS
+              value: "20000"
             # Google External Application Load Balancers append
             # client-ip,load-balancer-ip. Discard the one trusted right-edge
             # proxy entry and select the next-to-last IP. Verify this exact

@@ -6,18 +6,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lab_core::Config;
+use lab_rgb::htlc;
 use lab_rgb::storage::RgbStore;
 use lab_rgb::swap::{self, SwapStore};
 use lab_rgb::{
     issue_nia, plan_transfer, verify_against_witness, IssueRequest, DEMO_INTERNAL_XONLY_HEX,
 };
-use lab_rgb::htlc;
 
 mod demo_swap;
 mod http_api;
 mod labd_axum;
 mod labd_legacy;
-
+mod rgb_demo;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -522,7 +522,9 @@ fn run() -> Result<()> {
     store.ensure()?;
 
     match cli.command {
-        Commands::Net { cmd: NetCmd::Status } => {
+        Commands::Net {
+            cmd: NetCmd::Status,
+        } => {
             let report = lab_chain::network_status(&cfg)?;
             println!(
                 "{}",
@@ -596,9 +598,7 @@ fn run() -> Result<()> {
             WalletCmd::Address { name, index } => {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&lab_chain::wallet_address(
-                        &cfg, &name, index
-                    )?)?
+                    serde_json::to_string_pretty(&lab_chain::wallet_address(&cfg, &name, index)?)?
                 );
             }
             WalletCmd::Balance { name } => {
@@ -648,7 +648,10 @@ fn run() -> Result<()> {
             } => {
                 let seal = match seal {
                     Some(s) => s,
-                    None if chain.starts_with("bitcoin") || chain == "testnet" || chain == "testnet3" => {
+                    None if chain.starts_with("bitcoin")
+                        || chain == "testnet"
+                        || chain == "testnet3" =>
+                    {
                         let btc = lab_btc::BtcConfig::from_env();
                         lab_btc::pick_largest_utxo(&cfg, &btc, &wallet)?.outpoint
                     }
@@ -822,7 +825,8 @@ fn run() -> Result<()> {
             }
             RgbCmd::Consign { cmd } => match cmd {
                 ConsignCmd::Put { id, file } => {
-                    let bytes = fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+                    let bytes =
+                        fs::read(&file).with_context(|| format!("read {}", file.display()))?;
                     let path = store.save_consignment_blob(&id, &bytes)?;
                     println!(
                         "{}",
@@ -881,7 +885,8 @@ fn run() -> Result<()> {
                     ];
                     if rgb_wrap {
                         next = vec![
-                            "rgbmvp swap fund-btc --id … --rgb-wrap  # value + RGB→HTLC seal".into(),
+                            "rgbmvp swap fund-btc --id … --rgb-wrap  # value + RGB→HTLC seal"
+                                .into(),
                             "rgbmvp swap fund-lq --id … --rgb-wrap".into(),
                             "rgbmvp swap claim-lq --id …  # preimage + re-anchor + verify".into(),
                             "rgbmvp swap claim-btc --id … --from-witness".into(),
@@ -962,7 +967,8 @@ fn run() -> Result<()> {
                         amount_sats.saturating_sub(1),
                     )
                     .ok();
-                    let (bc_val, ftxid, fvout, fval, reused) = if let Some((tx, vo, va)) = existing {
+                    let (bc_val, ftxid, fvout, fval, reused) = if let Some((tx, vo, va)) = existing
+                    {
                         (
                             serde_json::json!({
                                 "txid": tx,
@@ -1058,8 +1064,7 @@ fn run() -> Result<()> {
                 } => {
                     let svc = lab_api::SwapService::new(&cfg.data_dir);
                     let mut s = store.load(&id)?;
-                    let mut out =
-                        svc.claim_lq(&cfg, &mut s, fee_sats, commitment_sats, entropy)?;
+                    let mut out = svc.claim_lq(&cfg, &mut s, fee_sats, commitment_sats, entropy)?;
                     svc.recompute_and_save(&mut s)?;
                     out["phase"] = serde_json::json!(s.phase);
                     println!("{}", serde_json::to_string_pretty(&out)?);
@@ -1314,8 +1319,7 @@ fn run() -> Result<()> {
                     let btc_res = lab_btc::sweep_all_demo_exits(&cfg, &btc, &to, fee_sats)?;
                     let mut out = serde_json::json!({ "bitcoin": btc_res });
                     if include_liquid {
-                        let lq_res =
-                            lab_chain::sweep_all_demo_exits_lq(&cfg, &lq_to, lq_fee_sats)?;
+                        let lq_res = lab_chain::sweep_all_demo_exits_lq(&cfg, &lq_to, lq_fee_sats)?;
                         out["liquid"] = serde_json::to_value(&lq_res)?;
                     }
                     println!("{}", serde_json::to_string_pretty(&out)?);
@@ -1352,6 +1356,10 @@ fn run() -> Result<()> {
             // U5 Axum is default; LABD_HTTP=legacy restores handwritten TCP server.
             let backend = std::env::var("LABD_HTTP").unwrap_or_else(|_| "axum".into());
             if backend.eq_ignore_ascii_case("legacy") {
+                anyhow::ensure!(
+                    !rgb_demo::policy_from_env().enabled,
+                    "LABD_RGB_DEMO requires the default Axum HTTP backend"
+                );
                 labd_legacy::serve_labd_legacy(&cfg, &bind)?;
             } else {
                 labd_axum::serve(&cfg, &bind)?;
@@ -1472,10 +1480,7 @@ fn run() -> Result<()> {
                 )?;
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
-            BfaCmd::Audit {
-                history,
-                fetch_rpc,
-            } => {
+            BfaCmd::Audit { history, fetch_rpc } => {
                 let s = fs::read_to_string(&history)
                     .with_context(|| format!("read {}", history.display()))?;
                 let hist: lab_rgb::bfa::BfaHistory = serde_json::from_str(&s)?;
@@ -1522,6 +1527,5 @@ fn run() -> Result<()> {
     }
     Ok(())
 }
-
 
 // S3 fund-wrap / claim / extract-preimage live in lab_api::s3 + SwapService.
