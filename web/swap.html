@@ -178,7 +178,7 @@ ul.disclaim li{margin:.3rem 0}
     }
     if (window.turnstile && state.widgetId === null) {
       state.widgetId = window.turnstile.render("#turnstile-slot", {
-        sitekey: state.sitekey, theme: "dark",
+        sitekey: state.sitekey, action: "rgbmvp_demo_swap", theme: "dark",
         callback: function (t) { state.token = t; refreshButton(); },
         "expired-callback": function () { state.token = null; refreshButton(); },
         "error-callback": function () { state.token = null; refreshButton(); }

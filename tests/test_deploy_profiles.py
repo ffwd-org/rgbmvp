@@ -27,6 +27,15 @@ def test_t1_demo_uses_explicit_google_xff_suffix() -> None:
     assert "- name: LABD_TRUST_XFF" not in demo
 
 
+def test_t1_demo_pins_turnstile_action_and_hostname_context() -> None:
+    demo = (ROOT / "deploy/cloudrun-demo.yaml").read_text(encoding="utf-8")
+    swap = (ROOT / "web/swap.html").read_text(encoding="utf-8")
+    server = (ROOT / "crates/lab-cli/src/demo_swap.rs").read_text(encoding="utf-8")
+    assert "- name: LABD_DEMO_TURNSTILE_HOSTNAMES" in demo
+    assert 'action: "rgbmvp_demo_swap"' in swap
+    assert 'pub const TURNSTILE_ACTION: &str = "rgbmvp_demo_swap";' in server
+
+
 def test_t1_freeze_profile_removes_mutation_and_custody() -> None:
     freeze = (ROOT / "deploy/cloudrun-demo-freeze.yaml").read_text(encoding="utf-8")
     forbidden = (
@@ -34,6 +43,7 @@ def test_t1_freeze_profile_removes_mutation_and_custody() -> None:
         "- name: LABD_API_TOKEN",
         "- name: RGBMVP_SECRET_DIR",
         "- name: LABD_DEMO_TURNSTILE_SECRET",
+        "- name: LABD_DEMO_TURNSTILE_HOSTNAMES",
         "- name: LABD_TRUST_XFF",
         "- name: LABD_DEMO_SWEEP_INTERVAL_SECS",
         "secretKeyRef:",

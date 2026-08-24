@@ -203,6 +203,8 @@ export PROJECT=silicon-pointer-490721-r0     # your project
 export REGION=us-central1
 export BUCKET="${PROJECT}-rgbmvp-demo-data"
 export IMAGE_TAG=REVIEWED_SHA                  # same reviewed image as T1
+# Exact public DNS name(s), comma-separated; no scheme/path/wildcard.
+export TURNSTILE_HOSTNAMES=rgbmvp-demo.example.com
 ```
 
 ### 5.1 Enable APIs and create the runtime identity
@@ -289,7 +291,14 @@ done
 
 ### 5.4 Deploy
 
-Edit `deploy/cloudrun-demo.yaml`, replacing `PROJECT`, `REGION`, `TAG`, then:
+Edit `deploy/cloudrun-demo.yaml`, replacing `PROJECT`, `REGION`, `TAG`,
+`TURNSTILE_SITEKEY`, and `TURNSTILE_HOSTNAMES`, then verify that the latter is
+the exact DNS hostname configured on the Turnstile widget. The widget requests
+the fixed action `rgbmvp_demo_swap`; Siteverify must echo both that action and
+one configured hostname or admission fails closed. Schemes, ports, paths, and
+wildcards are rejected at startup.
+
+Then deploy:
 
 ```bash
 gcloud run services replace deploy/cloudrun-demo.yaml \

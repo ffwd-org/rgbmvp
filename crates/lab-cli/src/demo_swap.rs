@@ -32,6 +32,12 @@ const DRIVER_POLL: Duration = Duration::from_secs(60);
 const TURNSTILE_VERIFY_URL: &str =
     "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
+/// Context bound into every public demo token. The browser requests this
+/// action and Siteverify must echo it exactly before admission can continue.
+pub const TURNSTILE_ACTION: &str = "rgbmvp_demo_swap";
+
+const TURNSTILE_HOSTNAMES_ENV: &str = "LABD_DEMO_TURNSTILE_HOSTNAMES";
+
 pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -217,11 +223,90 @@ fn turnstile_secret() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn valid_hostname(hostname: &str) -> bool {
+    if hostname.is_empty() || hostname.len() > 253 || !hostname.is_ascii() {
+        return false;
+    }
+    hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+fn parse_turnstile_hostnames(raw: Option<&str>) -> Result<Vec<String>> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .context("LABD_DEMO_TURNSTILE_HOSTNAMES is unset or empty")?;
+    let mut hostnames = Vec::new();
+    for item in raw.split(',') {
+        let hostname = item.trim().to_ascii_lowercase();
+        if !valid_hostname(&hostname) {
+            anyhow::bail!("invalid hostname in LABD_DEMO_TURNSTILE_HOSTNAMES");
+        }
+        if !hostnames.contains(&hostname) {
+            hostnames.push(hostname);
+        }
+    }
+    anyhow::ensure!(
+        !hostnames.is_empty(),
+        "LABD_DEMO_TURNSTILE_HOSTNAMES contains no hostnames"
+    );
+    Ok(hostnames)
+}
+
+fn turnstile_hostnames() -> Result<Vec<String>> {
+    let raw = std::env::var(TURNSTILE_HOSTNAMES_ENV).ok();
+    parse_turnstile_hostnames(raw.as_deref())
+}
+
+/// Refuse to start a protected T1 service unless both the server secret and
+/// the exact hostname allowlist are configured.
+pub fn validate_turnstile_config() -> Result<()> {
+    anyhow::ensure!(
+        turnstile_secret().is_some(),
+        "LABD_DEMO_TURNSTILE_SECRET is unset or empty"
+    );
+    turnstile_hostnames()?;
+    Ok(())
+}
+
+fn turnstile_response_matches(v: &Value, allowed_hostnames: &[String]) -> bool {
+    if v.get("success").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if v.get("action").and_then(Value::as_str) != Some(TURNSTILE_ACTION) {
+        return false;
+    }
+    let Some(hostname) = v.get("hostname").and_then(Value::as_str) else {
+        return false;
+    };
+    let hostname = hostname.trim().to_ascii_lowercase();
+    valid_hostname(&hostname) && allowed_hostnames.iter().any(|allowed| allowed == &hostname)
+}
+
 /// Verify a Cloudflare Turnstile token server-side.
 ///
 /// **Blocking**: call inside `spawn_blocking`.
 pub fn verify_turnstile_blocking(token: Option<&str>, remote_ip: Option<&str>) -> BotCheck {
-    verify_turnstile_with(turnstile_secret().as_deref(), token, remote_ip)
+    let hostnames = match turnstile_hostnames() {
+        Ok(hostnames) => hostnames,
+        Err(e) => {
+            eprintln!("demo: turnstile hostname configuration invalid: {e}");
+            return BotCheck::Failed;
+        }
+    };
+    verify_turnstile_with(
+        turnstile_secret().as_deref(),
+        token,
+        remote_ip,
+        &hostnames,
+    )
 }
 
 /// Verification with an explicit secret, so callers (and tests) never depend on
@@ -230,6 +315,7 @@ pub fn verify_turnstile_with(
     secret: Option<&str>,
     token: Option<&str>,
     remote_ip: Option<&str>,
+    allowed_hostnames: &[String],
 ) -> BotCheck {
     // Required but unconfigured: refuse rather than silently allow.
     let secret = match secret.map(str::trim).filter(|s| !s.is_empty()) {
@@ -258,10 +344,18 @@ pub fn verify_turnstile_with(
     if let Some(ip) = remote_ip {
         form.push(("remoteip", ip));
     }
-    match client.post(TURNSTILE_VERIFY_URL).form(&form).send() {
+    match client
+        .post(TURNSTILE_VERIFY_URL)
+        .form(&form)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+    {
         Ok(resp) => match resp.json::<Value>() {
-            Ok(v) if v.get("success").and_then(|s| s.as_bool()) == Some(true) => BotCheck::Pass,
-            Ok(_) => BotCheck::Failed,
+            Ok(v) if turnstile_response_matches(&v, allowed_hostnames) => BotCheck::Pass,
+            Ok(_) => {
+                eprintln!("demo: turnstile response failed success/action/hostname validation");
+                BotCheck::Failed
+            }
             Err(e) => {
                 eprintln!("demo: turnstile response parse failed: {e}");
                 BotCheck::Failed
@@ -868,9 +962,13 @@ mod tests {
     #[test]
     fn turnstile_missing_token_is_reported_as_missing() {
         let secret = Some("test-secret");
-        assert_eq!(verify_turnstile_with(secret, None, None), BotCheck::Missing);
+        let hostnames = vec!["demo.example".to_string()];
         assert_eq!(
-            verify_turnstile_with(secret, Some("  "), None),
+            verify_turnstile_with(secret, None, None, &hostnames),
+            BotCheck::Missing
+        );
+        assert_eq!(
+            verify_turnstile_with(secret, Some("  "), None, &hostnames),
             BotCheck::Missing
         );
     }
@@ -879,16 +977,62 @@ mod tests {
     /// unconfigured server must never wave traffic through.
     #[test]
     fn turnstile_without_secret_fails_closed() {
+        let hostnames = vec!["demo.example".to_string()];
         assert_eq!(
-            verify_turnstile_with(None, Some("some-token"), None),
+            verify_turnstile_with(None, Some("some-token"), None, &hostnames),
             BotCheck::Failed
         );
         assert_eq!(
-            verify_turnstile_with(Some("   "), Some("some-token"), None),
+            verify_turnstile_with(Some("   "), Some("some-token"), None, &hostnames),
             BotCheck::Failed
         );
         // Fails closed even when no token is supplied either.
-        assert_eq!(verify_turnstile_with(None, None, None), BotCheck::Failed);
+        assert_eq!(
+            verify_turnstile_with(None, None, None, &hostnames),
+            BotCheck::Failed
+        );
+    }
+
+    #[test]
+    fn turnstile_response_requires_exact_action_and_allowed_hostname() {
+        let allowed = vec!["rgbmvp-demo.example".to_string()];
+        let valid = json!({
+            "success": true,
+            "action": TURNSTILE_ACTION,
+            "hostname": "rgbmvp-demo.example",
+        });
+        assert!(turnstile_response_matches(&valid, &allowed));
+
+        for invalid in [
+            json!({"success": false, "action": TURNSTILE_ACTION, "hostname": "rgbmvp-demo.example"}),
+            json!({"success": true, "hostname": "rgbmvp-demo.example"}),
+            json!({"success": true, "action": "other_action", "hostname": "rgbmvp-demo.example"}),
+            json!({"success": true, "action": TURNSTILE_ACTION}),
+            json!({"success": true, "action": TURNSTILE_ACTION, "hostname": "attacker.example"}),
+        ] {
+            assert!(!turnstile_response_matches(&invalid, &allowed), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn turnstile_hostname_config_rejects_wildcards_urls_ports_and_empty_values() {
+        assert!(parse_turnstile_hostnames(None).is_err());
+        assert!(parse_turnstile_hostnames(Some(" ")).is_err());
+        for invalid in [
+            "*.example.com",
+            "https://example.com",
+            "example.com:443",
+            "example.com/path",
+            "example..com",
+            "-demo.example",
+            "demo-.example",
+        ] {
+            assert!(parse_turnstile_hostnames(Some(invalid)).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            parse_turnstile_hostnames(Some(" Demo.Example,other.example,demo.example ")).unwrap(),
+            vec!["demo.example", "other.example"]
+        );
     }
 
     #[test]
