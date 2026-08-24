@@ -135,6 +135,10 @@ spec:
             # Replace with the value from your Turnstile widget.
             - name: LABD_DEMO_TURNSTILE_SITEKEY
               value: TURNSTILE_SITEKEY
+            # Siteverify must echo action=rgbmvp_demo_swap and one of these
+            # exact DNS names. No schemes, ports, paths, or wildcards.
+            - name: LABD_DEMO_TURNSTILE_HOSTNAMES
+              value: TURNSTILE_HOSTNAMES
             - name: LABD_DEMO_TURNSTILE_SECRET
               valueFrom:
                 secretKeyRef:

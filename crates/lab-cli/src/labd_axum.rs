@@ -98,7 +98,10 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
             demo.swaps_remaining_in_budget()
         );
         eprintln!("  T1 client IP: {}", client_ip_policy.description());
-        if !p.turnstile_required {
+        if p.turnstile_required {
+            demo_swap::validate_turnstile_config()
+                .context("T1 refused: Turnstile context is not fail-closed")?;
+        } else {
             eprintln!("  WARNING: demo swaps running WITHOUT bot protection (local/testing only)");
         }
         // Budget accounting reserves `max_fee_per_swap_sats` per swap. If the
@@ -1299,6 +1302,7 @@ mod tests {
     async fn demo_swap_requires_turnstile_token() {
         std::env::set_var("LABD_PUBLIC_READ_ONLY", "1");
         std::env::set_var("LABD_DEMO_TURNSTILE_SECRET", "test-secret");
+        std::env::set_var("LABD_DEMO_TURNSTILE_HOSTNAMES", "demo.example");
         std::env::remove_var("LABD_API_TOKEN");
         let mut cfg = Config::load().expect("config");
         cfg.security = lab_core::MutationPolicy::from_env(&cfg.labd_bind);
@@ -1329,6 +1333,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], json!("turnstile_required"));
+        std::env::remove_var("LABD_DEMO_TURNSTILE_HOSTNAMES");
         std::env::remove_var("LABD_DEMO_TURNSTILE_SECRET");
         std::env::remove_var("LABD_PUBLIC_READ_ONLY");
     }

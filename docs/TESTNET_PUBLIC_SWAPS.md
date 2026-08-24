@@ -201,7 +201,10 @@ measured BTC scarcity). Implement each as config so they tune without a redeploy
   `1` selects the next-to-last client IP. Invalid, duplicate, oversized, or
   underspecified chains fall back to the socket-peer bucket.
 - **Bot protection:** Cloudflare **Turnstile** in front of the trigger
-  (server-side siteverify). Use the `turnstile-spin` workflow.
+  (server-side Siteverify). The widget requests the fixed action
+  `rgbmvp_demo_swap`; the server requires `success=true`, that exact action, and
+  a hostname in `LABD_DEMO_TURNSTILE_HOSTNAMES`. Missing or malformed hostname
+  configuration refuses T1 startup. Use the `turnstile-spin` workflow.
 - **Body/label limits:** already enforced (`DefaultBodyLimit`, `is_safe_path_id`).
 
 ### W3 — Custody & key management
@@ -339,7 +342,7 @@ cannot quietly widen the policy.
 
 | Item | Work |
 |---|---|
-| W9.2 | Turnstile widget → `POST /v1/demo/swap` with `{turnstile_token}` → `{swap_id}` |
+| W9.2 | Turnstile widget (`action=rgbmvp_demo_swap`) → `POST /v1/demo/swap` with `{turnstile_token}` → Siteverify success + exact action + exact hostname → `{swap_id}` |
 | W9.3 | Poll `GET /v1/swap/{id}`; render `steps[]` as a checklist with per-tx explorer links; stop on `done`/`refunded`; surface the wait honestly (“waiting for a Bitcoin block — this can take a while on testnet”) |
 | W9.4 | Quota banner from `/v1/demo/quota`: swaps left today, “paused — awaiting faucet refill” when a float floor is hit, disable the button with a countdown on `Retry-After` |
 | W9.5 | Typed denial rendering — friendly copy per `code` (`turnstile_required`, `demo_cooldown`, `demo_daily_cap`, `demo_busy`, `demo_budget_exhausted`, `demo_low_float`, `demo_float_unknown`); never show raw JSON |
@@ -369,7 +372,10 @@ Turnstile key provisioning (a Cloudflare account step, tracked separately).
 `/v1/demo/quota`. **Without it the page renders a "bot check is not configured"
 state and keeps the trigger disabled** rather than showing a broken widget — so
 the Turnstile-shaped hole fails safe, and closing it later is config-only, not
-a code change.
+a code change. Public T1 also requires a comma-separated exact DNS allowlist in
+`LABD_DEMO_TURNSTILE_HOSTNAMES`; URLs, ports, paths, wildcards, and malformed
+labels are rejected. A successful token from another widget action or hostname
+is rejected before chain reads or fee admission.
 
 **Still unverifiable until a key exists:** the Turnstile *pass* path, end to end
 in a browser — the same gap noted in [T1_FIRST_SWAP.md](./T1_FIRST_SWAP.md) §10.
