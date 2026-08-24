@@ -89,6 +89,9 @@ Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
 - T1 rollback must target the live `rgbmvp-demo` service with
   `deploy/cloudrun-demo-freeze.yaml`. `deploy/cloudrun.yaml` names the separate
   `rgbmvp-public` service and cannot disable or replace T1.
+- Per-IP quotas use `LABD_XFF_TRUSTED_HOPS`, the exact trusted right-edge XFF
+  suffix length. Never restore the Boolean `LABD_TRUST_XFF`, select the
+  rightmost entry, accept invalid IP tokens, or trust XFF on an unverified path.
 
 ## Local development
 

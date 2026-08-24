@@ -140,9 +140,11 @@ spec:
                 secretKeyRef:
                   name: rgbmvp-demo-turnstile-secret
                   key: latest
-            # Per-IP quotas: Cloud Run fronts us, so the rightmost
-            # X-Forwarded-For entry is the real client.
-            - name: LABD_TRUST_XFF
+            # Google External Application Load Balancers append
+            # client-ip,load-balancer-ip. Discard the one trusted right-edge
+            # proxy entry and select the next-to-last IP. Verify this exact
+            # topology during acceptance; direct/unexpected paths fail closed.
+            - name: LABD_XFF_TRUSTED_HOPS
               value: "1"
             # --- Budget (docs/TESTNET_PUBLIC_SWAPS.md §1a) ---
             - name: LABD_DEMO_LEG_SATS

@@ -21,6 +21,12 @@ def test_t1_full_rollback_targets_the_live_demo_service() -> None:
     assert service_name("deploy/cloudrun.yaml") == "rgbmvp-public"
 
 
+def test_t1_demo_uses_explicit_google_xff_suffix() -> None:
+    demo = (ROOT / "deploy/cloudrun-demo.yaml").read_text(encoding="utf-8")
+    assert "- name: LABD_XFF_TRUSTED_HOPS\n              value: \"1\"" in demo
+    assert "- name: LABD_TRUST_XFF" not in demo
+
+
 def test_t1_freeze_profile_removes_mutation_and_custody() -> None:
     freeze = (ROOT / "deploy/cloudrun-demo-freeze.yaml").read_text(encoding="utf-8")
     forbidden = (

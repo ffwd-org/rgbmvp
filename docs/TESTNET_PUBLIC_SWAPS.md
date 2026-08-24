@@ -196,6 +196,10 @@ measured BTC scarcity). Implement each as config so they tune without a redeploy
   extend the existing `RateLimiter` (`lab-core/src/security.rs`) to cover
   `/v1/demo/swap`; add an in-flight counter, a per-day swap counter, and a
   running 2-week fee-budget counter that hard-stops at ~28,000 sats BTC.
+- **Proxy-aware identity:** configure the exact trusted right-edge XFF suffix
+  with `LABD_XFF_TRUSTED_HOPS`. For the documented Google load-balancer chain,
+  `1` selects the next-to-last client IP. Invalid, duplicate, oversized, or
+  underspecified chains fall back to the socket-peer bucket.
 - **Bot protection:** Cloudflare **Turnstile** in front of the trigger
   (server-side siteverify). Use the `turnstile-spin` workflow.
 - **Body/label limits:** already enforced (`DefaultBodyLimit`, `is_safe_path_id`).
