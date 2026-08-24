@@ -165,13 +165,19 @@ GET  /v1/demo/quota           (optional: remaining global/per-IP budget)
 
 Server-side orchestrator walks the existing phases
 (`init → fund_btc → fund_lq → claim_lq → claim_btc → done`) via the internal
-`SwapService`, never via the public HTTP action path. Every mutating step stays
-behind the existing `MutationPolicy` (token/loopback); the public endpoint is the
-*only* new hole, and it carries no attacker-controlled protocol parameters.
+`SwapService`, never via the public HTTP action path. Every arbitrary mutating
+step stays behind the existing `MutationPolicy` (token/loopback); the exact
+public path carries no attacker-controlled protocol parameters.
 
 **ADR-T1 (new):** public mutation is allowed **only** through `/v1/demo/swap`,
 with server-fixed parameters, on testnet, behind Turnstile + quotas. All other
 mutating endpoints remain denied in public mode. Reverting = unset the demo flag.
+
+The later fixed RGB lab adds one separate exact exception,
+`POST /v1/demo/rgb/run`. It accepts only `turnstile_token`, binds action
+`rgbmvp_rgb_lab`, runs predefined `bob → alice` Issue → Transfer → Verify on
+Liquid Testnet, and uses `/data/rgb_demo_budget.json`; it neither broadens
+`/v1/rgb/*` nor shares T1's quota ledger.
 
 ---
 
@@ -389,8 +395,8 @@ Everything else was exercised with `LABD_DEMO_TURNSTILE_REQUIRED=0`.
 - W1–W8 complete; abuse + chaos + refund tests pass.
 - Secrets via Secret Manager; image scans clean; `cargo audit` clean.
 - Kill switch verified: one redeploy returns to read-only freeze.
-- `GET /v1/security` shows expected posture; only `/v1/demo/swap` is publicly
-  mutating.
+- `GET /v1/security` shows expected posture; only enabled exact demo paths are
+  publicly mutating, and all arbitrary `/v1/rgb/*` and `/v1/swap/*` remain locked.
 
 **Daily during soak:**
 - Check faucet float, error rates, quota saturation, cost vs. budget.

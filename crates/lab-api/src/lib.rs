@@ -31,7 +31,7 @@ pub fn root_json() -> Value {
         "product": lab_core::PRODUCT,
         "api": lab_core::API_VERSION,
         "phase": "u5-axum",
-        "message": "RGB Liquid Testnet Lab — U5 labd on Axum; U4 security gate: public demos are read-only; keys stay off the Internet.",
+        "message": "RGB Liquid Testnet Lab — U5 labd on Axum; arbitrary public mutations are locked and optional demo flows are fixed, gated, and quota-limited.",
         "security": {
             "browser_seeds": false,
             "preimage_redacted_on_swap_get": true,
@@ -58,6 +58,8 @@ pub fn root_json() -> Value {
             "swap_action": "POST /v1/swap/{id}/action",
             "demo_wallets": "GET /v1/demo/wallets",
             "demo_activity": "GET /v1/demo/activity",
+            "demo_rgb_quota": "GET /v1/demo/rgb/quota",
+            "demo_rgb_run": "POST /v1/demo/rgb/run (optional; Turnstile + fixed parameters)",
             "audit_bfa": "POST /v1/audit/bfa",
             "audit_bfa_samples": "GET /v1/audit/bfa/samples",
             "phases": "GET /v1/phases"
@@ -96,12 +98,15 @@ pub fn security_json(public_read_only: bool, loopback_bind: bool, token_configur
         "loopback_bind": loopback_bind,
         "api_token_configured": token_configured,
         "mutations": if public_read_only {
-            "require_bearer_token"
+            "require_bearer_token_except_enabled_exact_demo_paths"
         } else if loopback_bind {
             "open_on_loopback_unless_token_set"
         } else {
             "require_bearer_token"
         },
+        "compute_only_posts": [
+            "POST /v1/audit/bfa (embedded witness_tx_hex required on public hosts)"
+        ],
         "public_surface": [
             "GET /",
             "GET /demo",
@@ -117,7 +122,9 @@ pub fn security_json(public_read_only: bool, loopback_bind: bool, token_configur
             "GET /v1/rgb/contracts",
             "GET /v1/rgb/plans/{id}",
             "GET /v1/demo/*",
+            "POST /v1/demo/rgb/run (optional; exact flag-gated fixed flow)",
             "GET /v1/audit/bfa/samples",
+            "POST /v1/audit/bfa",
             "GET /artifacts/public/bfa/*"
         ],
         "doc": "docs/U4_PUBLIC_HOSTING.md"

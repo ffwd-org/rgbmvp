@@ -177,12 +177,14 @@ rgbmvp serve --bind 127.0.0.1:8080
 | GET | `/v1/health` | Network + `rgb_ready` |
 | GET | `/v1/phases` | Ladder chip statuses |
 | GET | `/v1/demo/wallets` · `/v1/demo/activity` | Board |
+| GET | `/v1/demo/rgb/quota` | Fixed RGB lab parameters, limits, and usage |
+| POST | `/v1/demo/rgb/run` | Anonymous Turnstile-gated fixed `bob → alice` Issue → Transfer → Verify |
 | POST | `/v1/rgb/issue` · `/v1/rgb/transfer` · `/v1/rgb/verify` | Server-side lab wallets |
 | GET | `/v1/rgb/contracts` · `/v1/rgb/plans/{id}` | Stored artifacts |
 | POST | `/v1/swap/init` | Create session |
 | GET | `/v1/swap/{id}` | Public view; **preimage null** |
 | POST | `/v1/swap/{id}/action` | `fund_btc\|fund_lq\|claim_lq\|claim_btc\|refund_*\|set_contracts` |
-| POST | `/v1/audit/bfa` | BFA history body |
+| POST | `/v1/audit/bfa` | BFA history body; public compute-only mode requires embedded witness hex |
 
 Static: `/`, `/status`, `/demo`, `/audit`.
 

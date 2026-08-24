@@ -136,7 +136,7 @@
             <tr><th>Id</th><th>Phase</th><th>Links</th></tr>
             ${swaps.map(s => `
               <tr>
-                <td><a href="/?swap=${encodeURIComponent(s.id)}#lab">${esc(s.id)}</a></td>
+                <td><a href="${safeUrl(s.ui_url || ('/?swap=' + encodeURIComponent(s.id) + '#lab'))}">${esc(s.id)}</a></td>
                 <td class="phase ${esc(s.phase)}">${esc(s.phase)}</td>
                 <td>
                   <a href="${safeUrl(s.status_url)}">API</a>
