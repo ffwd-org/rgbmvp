@@ -861,7 +861,9 @@ fn run() -> Result<()> {
                     lq_contract,
                     rgb_wrap,
                 } => {
+                    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
                     let session = swap::init_swap(
+                        &keyring,
                         &id,
                         csv_delay,
                         &alice_btc,
@@ -1095,7 +1097,9 @@ fn run() -> Result<()> {
                         &s.htlc_btc.address_btc,
                         amount.saturating_sub(1),
                     )?;
-                    let (refund_sk, _) = htlc::demo_keypair(&s.htlc_btc.refund_label)?;
+                    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
+                    let (refund_sk, _) =
+                        keyring.derive_for_session(&s.htlc_btc, &s.htlc_btc.refund_label)?;
                     let ws = hex::decode(&s.htlc_btc.witness_script_hex)?;
                     use bitcoin::key::{CompressedPublicKey, Secp256k1};
                     use bitcoin::{Address, Network};
@@ -1142,7 +1146,9 @@ fn run() -> Result<()> {
                         &s.htlc_lq.address_liquid_unconf,
                         amount.saturating_sub(1),
                     )?;
-                    let (refund_sk, _) = htlc::demo_keypair(&s.htlc_lq.refund_label)?;
+                    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
+                    let (refund_sk, _) =
+                        keyring.derive_for_session(&s.htlc_lq, &s.htlc_lq.refund_label)?;
                     let ws = hex::decode(&s.htlc_lq.witness_script_hex)?;
                     use bitcoin::key::{CompressedPublicKey, Secp256k1};
                     use bitcoin::{Address, Network};
@@ -1192,7 +1198,9 @@ fn run() -> Result<()> {
                         anyhow::bail!("hash must be 32 bytes");
                     }
                     h.copy_from_slice(&b);
-                    let info = htlc::build_htlc_addresses(&h, &claimer, &refund, csv_delay)?;
+                    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
+                    let info =
+                        htlc::build_htlc_addresses(&keyring, &h, &claimer, &refund, csv_delay)?;
                     println!("{}", serde_json::to_string_pretty(&info)?);
                 }
                 SwapCmd::ExtractPreimage { chain, txid, id } => {
@@ -1261,6 +1269,7 @@ fn run() -> Result<()> {
                     );
                 }
                 BtcCmd::DemoExits => {
+                    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
                     let mut out = Vec::new();
                     // Liquid-side exits: inspection only (no sweep implemented).
                     for label in lab_chain::LQ_DEMO_EXIT_LABELS {
@@ -1279,7 +1288,7 @@ fn run() -> Result<()> {
                         }
                     }
                     for label in lab_btc::BTC_DEMO_EXIT_LABELS {
-                        let (_, addr) = lab_btc::demo_exit_address(&btc, label)?;
+                        let (_, addr) = lab_btc::demo_exit_address(&btc, &keyring, label)?;
                         let a = addr.to_string();
                         let utxos = lab_btc::address_utxos(&btc, &a).unwrap_or_default();
                         out.push(serde_json::json!({

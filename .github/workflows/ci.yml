@@ -67,9 +67,29 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The commercial gitleaks-action requires a license key for organization
+      # repositories. Keep the same full-history gate with the official OSS CLI
+      # and verify the release archive before executing it.
+      - name: Install Gitleaks CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="8.30.1"
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          install_dir="${RUNNER_TEMP}/gitleaks"
+          mkdir -p "${install_dir}"
+          curl --fail --silent --show-error --location \
+            --output "${install_dir}/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}"
+          curl --fail --silent --show-error --location \
+            --output "${install_dir}/checksums.txt" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_checksums.txt"
+          (cd "${install_dir}" && grep " ${archive}$" checksums.txt | sha256sum --check)
+          tar -xzf "${install_dir}/${archive}" -C "${install_dir}" gitleaks
+          echo "GITLEAKS_BIN=${install_dir}/gitleaks" >> "${GITHUB_ENV}"
+      - name: Scan full Git history
+        run: |
+          "${GITLEAKS_BIN}" git --redact --verbose .
 
   python:
     name: pytest (optional glue)

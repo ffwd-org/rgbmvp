@@ -800,19 +800,19 @@ pub fn address_spk_hex(address: &str) -> Result<Vec<u8>> {
 // T1/W5 — Liquid demo HTLC exit addresses.
 //
 // Mirror of `lab_btc::demo_exit_address` for the Liquid legs. Both Liquid exit
-// paths (Alice's claim, Bob's refund) pay a P2WPKH derived from
-// `htlc::demo_keypair(<label>)`, never the funding wallet — same defect class
-// documented in docs/TESTNET_PUBLIC_SWAPS.md §1a.
+// paths (Alice's claim, Bob's refund) pay a P2WPKH derived from a custody-backed
+// root seed plus the public role label, never the funding wallet.
 // ---------------------------------------------------------------------------
 
 /// Labels every Liquid-side HTLC exit pays out to.
 pub const LQ_DEMO_EXIT_LABELS: [&str; 2] = ["alice-claimer", "bob-refund"];
 
 /// Unconfidential Liquid P2WPKH address a demo label receives at.
-pub fn demo_exit_address_lq(label: &str) -> Result<String> {
-    // demo_keypair already hands back the 33-byte compressed pubkey, so no
-    // secp dependency is needed here.
-    let (_, pk_bytes) = lab_rgb::htlc::demo_keypair(label)?;
+pub fn demo_exit_address_lq(
+    keyring: &lab_rgb::htlc::DemoKeyring,
+    label: &str,
+) -> Result<String> {
+    let (_, pk_bytes) = keyring.derive(label)?;
     // Same witness program as the Bitcoin form; Liquid testnet encodes it with
     // the `tex` HRP as an unconfidential address.
     let wpkh = elements::bitcoin::PublicKey::from_slice(&pk_bytes)
@@ -845,7 +845,8 @@ pub struct LqExitBalance {
 /// Only counts the explicit policy asset; confidential outputs are invisible
 /// here and would need a wallet scan.
 pub fn demo_exit_balance_lq(cfg: &Config, label: &str) -> Result<LqExitBalance> {
-    let address = demo_exit_address_lq(label)?;
+    let keyring = lab_rgb::htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
+    let address = demo_exit_address_lq(&keyring, label)?;
     let api = esplora_api_base(cfg);
     let url = format!("{api}/address/{address}/utxo");
     let v: serde_json::Value = reqwest::blocking::Client::builder()
@@ -885,6 +886,7 @@ pub struct LqSweepResult {
 /// invisible to this path and are left untouched.
 pub fn sweep_demo_exit_lq(
     cfg: &Config,
+    keyring: &lab_rgb::htlc::DemoKeyring,
     label: &str,
     to_address: &str,
     fee_sats: u64,
@@ -900,8 +902,8 @@ pub fn sweep_demo_exit_lq(
     };
     use std::str::FromStr;
 
-    let (sk_btc, pk_bytes) = lab_rgb::htlc::demo_keypair(label)?;
-    let address = demo_exit_address_lq(label)?;
+    let (sk_btc, pk_bytes) = keyring.derive(label)?;
+    let address = demo_exit_address_lq(keyring, label)?;
     let policy = Network::TestnetLiquid.policy_asset().to_string();
 
     // Collect confirmed, explicit policy-asset UTXOs.
@@ -1034,9 +1036,10 @@ pub fn sweep_all_demo_exits_lq(
     fee_sats: u64,
 ) -> Result<Vec<LqSweepResult>> {
     let dest = wallet_address(cfg, to_wallet, None)?.address;
+    let keyring = lab_rgb::htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
     let mut out = Vec::new();
     for label in LQ_DEMO_EXIT_LABELS {
-        match sweep_demo_exit_lq(cfg, label, &dest, fee_sats) {
+        match sweep_demo_exit_lq(cfg, &keyring, label, &dest, fee_sats) {
             Ok(r) => out.push(r),
             Err(e) => out.push(LqSweepResult {
                 label: label.to_string(),

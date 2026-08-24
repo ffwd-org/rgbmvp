@@ -1,4 +1,4 @@
-# Portable Project Memory v2.3 bundle
+# Portable Project Memory v2.4.0 bundle
 
 Copy these paths to another repository while preserving their relative locations:
 
@@ -10,7 +10,8 @@ project_memory/
 
 The root entrypoint discovers the repository from the copied package location. The bundle uses
 only Python 3.11+ standard-library modules. Redis remains optional and defaults to
-`redis://localhost:6379/0`; set `PROJECT_MEMORY_URL` or pass `--url` to override it.
+`redis://127.0.0.1:6379/0`; set `PROJECT_MEMORY_URL` or pass `--url` to override it.
+Release details and schema compatibility are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 Start with a minimal configuration:
 
@@ -35,6 +36,7 @@ accidental admission, but repositories must still keep real secrets outside sour
 
 ```bash
 python3 project-memory.py status
+python3 project-memory.py --version
 python3 project-memory.py index --incremental
 python3 project-memory.py index --incremental --repair-deep
 python3 project-memory.py validate
@@ -42,6 +44,7 @@ python3 project-memory.py validate --deep
 python3 project-memory.py search "authentication boundary" --limit 5
 python3 project-memory.py symbols "qualified.name" --limit 20
 python3 project-memory.py impact "symbol_name" --limit 20
+python3 project-memory.py path "source.qualified.name" "target.qualified.name" --edge-kind calls
 python3 project-memory.py evaluate --limit 10
 ```
 
@@ -83,6 +86,13 @@ transactionally stages exact graph keys, and safely collects obsolete records af
 `index --incremental --repair-deep` semantically repairs only corrupted graph owners without
 regenerating chunks. Embedded v2.2 graphs migrate automatically without re-embedding unchanged
 chunks.
+
+v2.4.0 adds a read-only `path` query over the resolved code graph. It uses deterministic
+breadth-first search because graph edges are categorical and unweighted, traverses only strong
+resolutions by default, supports forward or reverse direction, repeated edge-kind filters, and a
+bounded depth. `--include-probable` explicitly admits heuristic unique-short-name resolutions.
+Ambiguous and unresolved edges are never traversed. Path lookup derives adjacency in memory and
+does not change Redis records or the graph schema.
 
 Copy the Project Memory operating contract from the source repository's `AGENTS.md` into the
 target repository instructions. Repository files always remain authoritative; Redis results are

@@ -12,12 +12,14 @@ Agents use the portable root `project-memory.py`; the raw Redis representation i
 ```bash
 python3 project-memory.py index --incremental
 python3 project-memory.py index --incremental --repair-deep
+python3 project-memory.py --version
 python3 project-memory.py status
 python3 project-memory.py validate
 python3 project-memory.py validate --deep
 python3 project-memory.py search "health readiness boundary" --limit 5
 python3 project-memory.py symbols "qualified.name" --limit 20
 python3 project-memory.py impact "symbol_name" --limit 20
+python3 project-memory.py path "source.qualified.name" "target.qualified.name" --edge-kind calls
 python3 project-memory.py evaluate --limit 10
 python3 project-memory.py clear
 ```
@@ -32,6 +34,7 @@ All output is JSON.
 | `search QUERY [--limit N]` | Ranked path, line range, score, and text pointers | `0` success; `1` error (rejects missing/stale by default) |
 | `symbols QUERY [--limit N]` | Symbol definition pointers with parser confidence | `0` success; `1` error |
 | `impact QUERY [--limit N]` | Distinct incoming typed edges with resolution provenance | `0` success; `1` error |
+| `path SOURCE TARGET [options]` | Read-only minimum-hop dependency path with source pointers | `0` success; `1` error |
 | `evaluate [--limit N]` | Configured retrieval recall benchmark | `0` all pass; `2` misses; `1` error |
 | `clear` | Deletes only this namespace's recorded keys | `0` success; `1` error |
 
@@ -40,7 +43,7 @@ Indexing and namespace clearing share the same ownership lock and cannot run con
 
 ## Connection configuration
 
-- Default endpoint: `redis://localhost:6379/0` (no authentication).
+- Default endpoint: `redis://127.0.0.1:6379/0` (no authentication).
 - Override: `--url redis://host:port/db`, `PROJECT_MEMORY_URL`, or legacy `RGBMVP_PROJECT_MEMORY_URL`.
 - Authentication, TLS, query parameters, and non-`redis` schemes are intentionally unsupported.
 - If Redis is unavailable, continue from repository files and explicitly report that the optional cache was not consulted or refreshed.
@@ -153,6 +156,21 @@ transfer fell by 96.17% while preserving the same retrieval contract.
 
 The graph remains a disposable discovery aid. It does not replace compiler name resolution, type
 checking, or opening the returned current source file.
+
+## v2.4 dependency paths
+
+v2.4 keeps the cache, graph, graph-record, and namespace schemas unchanged while adding a read-only
+`path` query. Deterministic breadth-first search finds a minimum-hop route across resolved `calls`,
+`decorated_by`, `imports`, and `inherits` edges. Strong resolutions are traversed by default;
+`--include-probable` explicitly permits heuristic unique-short-name links. Ambiguous and unresolved
+edges are never traversed.
+
+Use `--direction reverse` for caller/importer routes, repeat `--edge-kind` to restrict traversal,
+and use `--max-depth` to bound exploration. Results contain ordered symbol and edge pointers, but
+remain discovery aids that must be checked against current repository source. v2.4 also adds exact
+repository-relative `exclude_paths`, `--version`, package `__version__`, and a boundary-safe strict
+UTF-8 probe. Activating the v2.4 manifest requires an incremental index; unchanged chunks and graph
+records remain reusable.
 
 **Raw Redis layout, hash fields, vector encoding, and stored text formatting are private implementation details, not a stable API.** Agents must not depend on them.
 

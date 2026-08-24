@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 pub use demo::{DemoDenial, DemoGovernor, DemoStatus, DemoSwapPolicy, Floats};
 pub use custody::{
-    resolve_secret_path, secret_dirs, CustodyCheck, CustodyIssue, KIND_MNEMONIC, KIND_WIF,
+    resolve_mounted_secret_path, resolve_secret_path, secret_dirs, CustodyCheck, CustodyIssue,
+    DEMO_EXIT_SECRET_NAME, KIND_EXIT_SEED, KIND_MNEMONIC, KIND_WIF,
 };
 pub use security::{
     constant_time_eq, cors_allow_origin, is_loopback_bind, is_mutation_method, is_safe_path_id,
@@ -154,6 +155,79 @@ impl Config {
         std::fs::create_dir_all(self.data_dir.join("tmp"))
             .with_context(|| format!("create tmp under {}", self.data_dir.display()))?;
         Ok(())
+    }
+
+    /// Create a high-entropy local development seed once. A configured secret
+    /// mount always fails closed when its seed is absent; it is never populated
+    /// from inside the application.
+    pub fn ensure_demo_exit_seed(&self) -> Result<PathBuf> {
+        let sdirs = secret_dirs();
+        let fallback = self.wallet_dir.join(DEMO_EXIT_SECRET_NAME);
+        if !sdirs.is_empty() {
+            if let Some(path) = resolve_mounted_secret_path(
+                &sdirs,
+                DEMO_EXIT_SECRET_NAME,
+                KIND_EXIT_SEED,
+            ) {
+                return Ok(path);
+            }
+            bail!(
+                "mounted RGBMVP_SECRET_DIR has no {}/{}; refusing to generate custody material",
+                DEMO_EXIT_SECRET_NAME,
+                KIND_EXIT_SEED
+            );
+        }
+        if let Some(path) = resolve_secret_path(
+            &[],
+            &fallback,
+            DEMO_EXIT_SECRET_NAME,
+            KIND_EXIT_SEED,
+        ) {
+            return Ok(path);
+        }
+
+        std::fs::create_dir_all(&fallback)
+            .with_context(|| format!("create demo exit secret dir {}", fallback.display()))?;
+        let path = fallback.join(KIND_EXIT_SEED);
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed)
+            .map_err(|e| anyhow::anyhow!("generate demo exit seed: {e}"))?;
+        let encoded = format!("{}\n", hex::encode(seed));
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("create demo exit seed {}", path.display()))?;
+            file.write_all(encoded.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, encoded.as_bytes())
+                .with_context(|| format!("create demo exit seed {}", path.display()))?;
+        }
+        Ok(path)
+    }
+
+    /// Read and validate the 32-byte seed without logging its contents.
+    pub fn demo_exit_seed(&self) -> Result<[u8; 32]> {
+        let path = self.ensure_demo_exit_seed()?;
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read demo exit seed {}", path.display()))?;
+        let bytes = hex::decode(raw.trim())
+            .with_context(|| format!("decode demo exit seed {} as hex", path.display()))?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "demo exit seed {} must decode to 32 bytes, got {}",
+                path.display(),
+                v.len()
+            )
+        })
     }
 
     pub fn wallet_path(&self, name: &str) -> PathBuf {

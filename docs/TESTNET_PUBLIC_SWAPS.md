@@ -56,35 +56,60 @@ testnet faucets are slow/dry, so the demo is sized around **BTC fee burn**, not
 Liquid. With the W5 sweep in place a swap permanently loses only *fees + any
 dust*; without it the leg value strands at a demo exit address (see below).
 
-### Where HTLC value actually goes (corrected 2026-08-11)
+### Where HTLC value actually goes (security-corrected 2026-08-13)
 
 An earlier draft of this plan claimed refunds "return value to the original
 funder". **That is wrong.** Every HTLC exit path — claim *and* refund, on both
-chains — pays a P2WPKH address derived from `htlc::demo_keypair(<label>)`
-(i.e. `sha256(label)`), never the funding wallet:
+chains — pays a P2WPKH child key derived by hardened BIP32 from a secret T1
+root seed and a public role label, never the funding wallet. The label selects
+a role; it is not private-key material:
 
 | Path | Destination | Chain |
 |---|---|---|
-| BTC claim | `P2WPKH(sha256("bob-claimer"))` | BTC |
-| BTC refund | `P2WPKH(sha256("alice-refund"))` | BTC |
-| Liquid claim | `P2WPKH(sha256("alice-claimer"))` | Liquid |
-| Liquid refund | `P2WPKH(sha256("bob-refund"))` | Liquid |
+| BTC claim | secret-seed child `bob-claimer` | BTC |
+| BTC refund | secret-seed child `alice-refund` | BTC |
+| Liquid claim | secret-seed child `alice-claimer` | Liquid |
+| Liquid refund | secret-seed child `bob-refund` | Liquid |
 
 Consequences:
 - **`btc-alice` drains on every swap regardless of outcome.** A completed swap
   costs it `leg + fund_fee`; the leg value lands at `bob-claimer`.
-- The keys are deterministic, so nothing is *lost* — but recovery requires an
-  explicit sweep, which is now implemented (`lab_btc::sweep_all_demo_exits`,
-  CLI `rgbmvp btc sweep-demo`, and automatically in the W5 watcher).
+- The addresses are deterministic only for an operator holding the 256-bit
+  root seed. Public labels and source code are insufficient to sign. Recovery
+  requires an explicit sweep, which is implemented
+  (`lab_btc::sweep_all_demo_exits`, CLI `rgbmvp btc sweep-demo`, and
+  automatically in the W5 watcher).
+
+### Mandatory migration from public-label exit keys
+
+Releases before the 2026-08-13 remediation used `sha256(public_label)` as a
+private key. Treat all four legacy exit keys as public and compromised. Do not
+deploy the new derivation over active legacy sessions:
+
+1. Keep `LABD_DEMO_SWAPS=0` and stop the watcher from creating new work.
+2. With the pre-remediation binary and wallet state, finish or refund every
+   active `demo-<epoch>-<seq>` session.
+3. Run `rgbmvp btc sweep-demo --to btc-alice --include-liquid --lq-to bob` and
+   verify all four legacy exit balances are zero.
+4. Provision the new `rgbmvp-demo-exit-seed` secret as described in
+   `deploy/README.md` §5.3, then deploy the remediated binary.
+5. Prove one operator-triggered testnet swap, its watcher pass, and its exit
+   sweep before enabling the public trigger.
+
+New session records include `exit_key_scheme` and a non-secret `exit_key_id`.
+Signing fails closed for legacy sessions or if the mounted seed does not match.
+Never rotate the seed while sessions or exit outputs remain; drain first and
+retain the old secret version until zero balances are independently verified.
 
 ### Cost model per completed swap (repo-proven fees)
 
 | Flow | Sats |
 |---|---|
 | `btc-alice` pays | **1,800** (1,000 leg + 800 fund fee) |
-| Burned to miners | 1,300 (800 fund + 500 claim) |
-| Recovered by sweep from `bob-claimer` | 500 |
-| **Net drain on btc-alice after sweep** | **1,300** |
+| Driver fees paid | 1,300 (800 fund + 500 claim/refund) |
+| Exit value before sweep | 500 |
+| Conservative exit-sweep allowance | up to 500 |
+| **Budget charge per admission** | **1,800** |
 
 **Cost-minimization defaults:**
 - **Value-only HTLC path (`rgb_wrap=false`)** — avoids tapret commitment dust
@@ -103,19 +128,23 @@ Consequences:
 | Control | Value | Rationale |
 |---|---|---|
 | Leg size (BTC & LQ) | 1,000 sats | Just above dust; minimal footprint |
-| BTC fee/swap | 1,300 sats | 800 fund + 500 claim (repo-proven) |
+| BTC budget/admission | 1,800 sats | 800 fund + 500 claim/refund + 500 sweep |
 | **BTC fee budget** | **28,000 sats** | of btc-alice's 33.6k, leaves buffer |
-| **Total swaps** | **~21** | 28,000 / 1,300 — *not* the ~70 an earlier 400-sat estimate implied |
-| Daily cap | 6 swaps | ~21 over the run with margin |
+| **Total admissions** | **15** | floor(28,000 / 1,800), with 1,000 sats headroom |
+| Daily cap | 6 swaps | budget binds within the bounded run |
 | Global rate | 1 concurrent · 1 new / 10 min | Prevents bursts / mempool spam |
 | Per-IP quota | 1 / hour · max 2 / day | One visitor can't hog the budget |
 | Pause floor — btc-alice | < 5,000 sats | Refill from btc-funder, else pause |
 | Pause floor — bob (LQ) | < 20,000 sats | Comfortable; LQ is plentiful |
 
-Without the sweep, runway would be 33,607 / 1,800 ≈ **18 swaps**; with it,
-the budget ceiling binds first at ~21. If the soak shows real fees are lower,
-lower `LABD_DEMO_BTC_FEE_SATS` and the runway extends. If BTC runs low the demo
+The budget never credits batching savings in advance: every admission consumes
+the full 1,800-sat capacity. If the soak establishes lower safe fees, all three
+fee inputs and the maximum reservation can be reviewed together. If BTC runs low the demo
 **pauses gracefully** (503), never drains or crashes.
+
+Under-reservation fails closed at startup, and unexpected actual fees are
+recorded without clamping; see
+[T1_FEE_UNDER_RESERVATION_REMEDIATION.md](./T1_FEE_UNDER_RESERVATION_REMEDIATION.md).
 
 ---
 
@@ -167,6 +196,10 @@ measured BTC scarcity). Implement each as config so they tune without a redeploy
   extend the existing `RateLimiter` (`lab-core/src/security.rs`) to cover
   `/v1/demo/swap`; add an in-flight counter, a per-day swap counter, and a
   running 2-week fee-budget counter that hard-stops at ~28,000 sats BTC.
+- **Proxy-aware identity:** configure the exact trusted right-edge XFF suffix
+  with `LABD_XFF_TRUSTED_HOPS`. For the documented Google load-balancer chain,
+  `1` selects the next-to-last client IP. Invalid, duplicate, oversized, or
+  underspecified chains fall back to the socket-peer bucket.
 - **Bot protection:** Cloudflare **Turnstile** in front of the trigger
   (server-side siteverify). Use the `turnstile-spin` workflow.
 - **Body/label limits:** already enforced (`DefaultBodyLimit`, `is_safe_path_id`).
@@ -187,6 +220,10 @@ measured BTC scarcity). Implement each as config so they tune without a redeploy
   demo is always warm and refund timers keep running.
 - Ensure swap sessions + consignments survive revision changes; verify a swap
   mid-flight during a deploy is not orphaned.
+- Admission is now write-ahead and fail-closed: no session or broadcast before
+  a durable reservation; recovered/unknown reservations remain charged; corrupt
+  state refuses startup. See
+  [T1_FEE_BUDGET_REMEDIATION.md](./T1_FEE_BUDGET_REMEDIATION.md).
 
 ### W5 — Refund/liveness safety
 - **Refund watcher:** background task that, after the CSV window, auto-refunds
@@ -202,7 +239,9 @@ measured BTC scarcity). Implement each as config so they tune without a redeploy
 - New Cloud Run profile (or a `deploy/cloudrun-demo.yaml`) diffed from the freeze:
   `LABD_DEMO_SWAPS=1`, Secret Manager mounts, persistent volume, `min-instances=1`,
   egress allowed to public **Esplora + Electrum** testnet endpoints.
-- Keep the freeze profile as the **rollback** target (one redeploy away).
+- Keep `deploy/cloudrun-demo-freeze.yaml` as the **same-service rollback**
+  target for `rgbmvp-demo`. `deploy/cloudrun.yaml` targets the independent
+  `rgbmvp-public` service and is not a T1 rollback.
 - Budget alerts + max-instances cap to bound cost.
 
 ### W7 — Observability & ops
@@ -242,9 +281,12 @@ a preimage-redaction regression test.
 **Daily soak checklist:** budget remaining · both floats vs floors · error rate ·
 one end-to-end swap spot-checked on the explorer · cost vs budget alert.
 
-**Incident response:** kill switch is `LABD_DEMO_SWAPS=0` (one `gcloud run
-services update`); full rollback is redeploying `deploy/cloudrun.yaml`. Both are
-in [`deploy/README.md` §5.6](../deploy/README.md).
+**Incident response:** kill switch is `LABD_DEMO_SWAPS=0` on `rgbmvp-demo`,
+followed by `update-traffic --to-latest` and an `enabled == false` check. After
+active sessions are resolved and exits swept, full rollback replaces that same
+service with `deploy/cloudrun-demo-freeze.yaml`; `deploy/cloudrun.yaml` must not
+be used because it names `rgbmvp-public`. See
+[`deploy/README.md` §5.6](../deploy/README.md).
 
 ### W8 — Testing (before public exposure)
 - Abuse simulation: hammer `/v1/demo/swap` past per-IP and global limits;

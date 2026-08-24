@@ -184,6 +184,16 @@ def test_env_example_and_supported_extensionless_sources_remain_allowed(tmp_path
     assert {".env.example", "Dockerfile.public", "Makefile"} <= names
 
 
+def test_utf8_probe_accepts_valid_codepoint_split_at_sample_boundary(tmp_path):
+    root = make_repo(tmp_path)
+    boundary = root / "docs" / "boundary.md"
+    boundary.write_bytes(b"a" * (pm.TEXT_PROBE_BYTES - 1) + "€\n".encode())
+
+    names = {path.relative_to(root).as_posix() for path in pm.included_files(root)}
+
+    assert "docs/boundary.md" in names
+
+
 def test_digest_staleness_and_ranking(tmp_path):
     root = make_repo(tmp_path)
     redis = FakeRedis()
@@ -323,7 +333,7 @@ def test_v20_manifest_without_file_chunk_map_migrates_on_next_index(tmp_path):
     migrated = migrated_result["manifest"]
 
     assert set(migrated["file_chunks"]) == set(first["files"])
-    assert migrated["bundle_version"] == "2.3.0"
+    assert migrated["bundle_version"] == pm.BUNDLE_VERSION
     assert migrated_result["metrics"]["files"]["changed"] == len(first["files"])
     assert migrated_result["metrics"]["files"]["unchanged"] == 0
     assert pm.validate(redis, root, deep=True)[1] is True
@@ -869,6 +879,69 @@ def test_python_resolution_preserves_ambiguity_and_attribute_uncertainty():
     assert calls["obj.validate"]["target_id"] is None
 
 
+def test_dependency_path_supports_forward_reverse_depth_and_probable_policy():
+    graphs = {
+        "src/chain.py": pm.extract_file_graph(
+            "src/chain.py",
+            "def leaf(): return 1\n"
+            "def middle(): return leaf()\n"
+            "def entry(): return middle()\n",
+        )
+    }
+
+    forward = pm.shortest_dependency_path(
+        graphs, "entry", "leaf", edge_kinds=["calls"]
+    )
+    reverse = pm.shortest_dependency_path(
+        graphs, "leaf", "entry", direction="reverse", edge_kinds=["calls"]
+    )
+    bounded = pm.shortest_dependency_path(
+        graphs, "entry", "leaf", edge_kinds=["calls"], max_depth=1
+    )
+    self_path = pm.shortest_dependency_path(graphs, "entry", "entry")
+
+    assert forward["found"] is True
+    assert forward["hop_count"] == 2
+    assert [item["name"] for item in forward["path"]] == ["entry", "middle", "leaf"]
+    assert reverse["found"] is True
+    assert reverse["hop_count"] == 2
+    assert bounded["found"] is False
+    assert self_path["found"] is True
+    assert self_path["hop_count"] == 0
+
+    probable_graphs = {
+        "src/utils.py": pm.extract_file_graph(
+            "src/utils.py", "def helper(): return 1\n"
+        ),
+        "src/caller.py": pm.extract_file_graph(
+            "src/caller.py", "def caller(): return helper()\n"
+        ),
+    }
+    strict = pm.shortest_dependency_path(probable_graphs, "caller", "helper")
+    opted_in = pm.shortest_dependency_path(
+        probable_graphs, "caller", "helper", include_probable=True
+    )
+    assert strict["found"] is False
+    assert opted_in["found"] is True
+    assert opted_in["steps"][0]["edge"]["resolution"]["confidence"] == "probable"
+
+
+def test_dependency_path_rejects_ambiguous_symbols_and_invalid_options():
+    graphs = {
+        "src/one.py": pm.extract_file_graph("src/one.py", "def helper(): pass\n"),
+        "src/two.py": pm.extract_file_graph("src/two.py", "def helper(): pass\n"),
+    }
+
+    with pytest.raises(ValueError, match="source symbol is ambiguous"):
+        pm.shortest_dependency_path(graphs, "helper", "src.one.helper")
+    with pytest.raises(ValueError, match="max_depth must be between"):
+        pm.shortest_dependency_path(graphs, "src.one.helper", "src.two.helper", max_depth=101)
+    with pytest.raises(ValueError, match="unsupported edge kinds"):
+        pm.shortest_dependency_path(
+            graphs, "src.one.helper", "src.two.helper", edge_kinds=["writes"]
+        )
+
+
 def test_rust_graph_is_explicitly_heuristic():
     graph = pm.extract_file_graph(
         "crates/demo/src/lib.rs",
@@ -1190,6 +1263,28 @@ def test_repository_can_add_exclusions_and_redis_environment_aliases(tmp_path):
     assert pm.redis_url_envs(root) == ("PROJECT_MEMORY_URL", "DEMO_PROJECT_MEMORY_URL")
 
 
+def test_repository_can_exclude_exact_relative_paths(tmp_path):
+    root = make_repo(tmp_path)
+    (root / "docs" / "public.md").write_text("public\n")
+    (root / "docs" / "private.md").write_text("private\n")
+    (root / pm.CONFIG_FILE).write_text(
+        json.dumps(
+            {
+                "include_patterns": ["docs/**/*.md"],
+                "exclude_paths": ["docs/private.md"],
+            }
+        )
+    )
+
+    names = {path.relative_to(root).as_posix() for path in pm.included_files(root)}
+    assert "docs/public.md" in names
+    assert "docs/private.md" not in names
+
+    (root / pm.CONFIG_FILE).write_text(json.dumps({"exclude_paths": ["../outside.md"]}))
+    with pytest.raises(ValueError, match="repository-relative paths"):
+        pm.included_files(root)
+
+
 def test_portable_bundle_runs_after_copy_to_another_repository(tmp_path):
     source_root = Path(__file__).parents[1]
     target = tmp_path / "copied-repository"
@@ -1208,6 +1303,15 @@ def test_portable_bundle_runs_after_copy_to_another_repository(tmp_path):
     )
     assert completed.returncode == 0
     assert "Portable, project-scoped Redis retrieval cache" in completed.stdout
+    version = subprocess.run(
+        [sys.executable, "project-memory.py", "--version"],
+        cwd=target,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert version.returncode == 0
+    assert version.stdout.strip() == pm.BUNDLE_VERSION
 
 
 def test_root_entrypoint_is_canonical_and_script_entrypoint_is_compatibility_only():

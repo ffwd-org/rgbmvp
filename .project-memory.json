@@ -45,6 +45,7 @@
     "fixtures",
     "secrets"
   ],
+  "exclude_paths": [],
   "evaluation_queries": [
     {
       "mode": "symbols",

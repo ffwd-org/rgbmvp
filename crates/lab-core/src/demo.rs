@@ -30,7 +30,7 @@ pub const DEMO_RGB_WRAP: bool = false;
 
 // Defaults — see the quota table in docs/TESTNET_PUBLIC_SWAPS.md §1a.
 pub const DEFAULT_LEG_SATS: u64 = 1_000;
-pub const DEFAULT_MAX_FEE_PER_SWAP_SATS: u64 = 1_300;
+pub const DEFAULT_MAX_FEE_PER_SWAP_SATS: u64 = 1_800;
 pub const DEFAULT_FEE_BUDGET_SATS: u64 = 28_000;
 pub const DEFAULT_DAILY_CAP: u32 = 6;
 pub const DEFAULT_MAX_CONCURRENT: u32 = 1;
@@ -243,6 +243,9 @@ pub struct DemoStatus {
     pub swaps_total: u32,
     pub fee_spent_sats: u64,
     pub fee_reserved_sats: u64,
+    /// Conservative charge for recovered reservations, unknown execution
+    /// outcomes, and known future fees such as exit sweeps.
+    pub fee_committed_sats: u64,
     pub day_index: u64,
     pub last_start_epoch: Option<u64>,
 }
@@ -257,6 +260,9 @@ struct GovernorState {
     /// Worst-case fees reserved by in-flight swaps. Reserving up front is what
     /// stops concurrent swaps from collectively overshooting the budget.
     fee_reserved_sats: u64,
+    /// Fees that may already have reached the network or are still required to
+    /// recover controlled outputs. They permanently consume budget.
+    fee_committed_sats: u64,
     last_start_epoch: Option<u64>,
     /// IP -> epoch seconds of recent starts (pruned to 24h).
     per_ip: HashMap<String, Vec<u64>>,
@@ -293,14 +299,21 @@ impl DemoGovernor {
         self.policy.enabled
     }
 
-    /// Restore persisted budget counters (W4). Only the spend/day counters are
-    /// restored; `in_flight` always starts at zero after a restart.
+    /// Restore persisted budget counters (W4).
+    ///
+    /// An in-flight reservation may already have paid a funding fee when the
+    /// process died. Move every recovered reservation into a permanent,
+    /// conservative commitment instead of releasing it. The concurrency slot
+    /// does not survive because the original driver no longer exists.
     pub fn restore(&self, snapshot: &DemoStatus) {
         let mut st = self.lock();
         st.day_index = snapshot.day_index;
         st.swaps_today = snapshot.swaps_today;
         st.swaps_total = snapshot.swaps_total;
         st.fee_spent_sats = snapshot.fee_spent_sats;
+        st.fee_committed_sats = snapshot
+            .fee_committed_sats
+            .saturating_add(snapshot.fee_reserved_sats);
         st.last_start_epoch = snapshot.last_start_epoch;
         st.in_flight = 0;
         st.fee_reserved_sats = 0;
@@ -321,8 +334,9 @@ impl DemoGovernor {
 
     /// Check every quota and, on success, reserve capacity for one swap.
     ///
-    /// The caller must later call [`DemoGovernor::finish`] (with the actual fee
-    /// spent) or [`DemoGovernor::abort`] to release the in-flight slot.
+    /// The caller must later settle with [`DemoGovernor::finish`], retain an
+    /// unknown outcome with [`DemoGovernor::fail_closed`], or call
+    /// [`DemoGovernor::abort`] only before execution starts.
     pub fn try_admit(
         &self,
         ip: &str,
@@ -353,8 +367,11 @@ impl DemoGovernor {
         }
 
         // Budget: reserve the worst case so concurrent swaps cannot overshoot.
-        let projected =
-            st.fee_spent_sats + st.fee_reserved_sats + self.policy.max_fee_per_swap_sats;
+        let projected = st
+            .fee_spent_sats
+            .saturating_add(st.fee_reserved_sats)
+            .saturating_add(st.fee_committed_sats)
+            .saturating_add(self.policy.max_fee_per_swap_sats);
         if projected > self.policy.fee_budget_sats {
             return Err(DemoDenial::FeeBudgetExhausted);
         }
@@ -398,17 +415,28 @@ impl DemoGovernor {
 
     /// Release the in-flight slot and settle the actual fee spent.
     ///
-    /// `actual_fee_sats` is clamped to the reservation: a runaway fee cannot
-    /// retroactively blow past the reserved worst case in the accounting.
+    /// Actual fees are never clamped to the reservation. A runtime overrun may
+    /// take accounted spend past the ceiling, but recording it in full ensures
+    /// every later admission fails instead of hiding expenditure.
     pub fn finish(&self, actual_fee_sats: u64) {
+        self.finish_with_liability(actual_fee_sats, 0);
+    }
+
+    /// Settle an admitted operation while retaining a conservative charge for
+    /// a known future fee (for example, sweeping its exit output).
+    pub fn finish_with_liability(&self, actual_fee_sats: u64, committed_fee_sats: u64) {
         let mut st = self.lock();
         let reserved = self.policy.max_fee_per_swap_sats.min(st.fee_reserved_sats);
         st.fee_reserved_sats -= reserved;
-        st.fee_spent_sats += actual_fee_sats.min(reserved);
+        st.fee_spent_sats = st.fee_spent_sats.saturating_add(actual_fee_sats);
+        st.fee_committed_sats = st
+            .fee_committed_sats
+            .saturating_add(committed_fee_sats);
         st.in_flight = st.in_flight.saturating_sub(1);
     }
 
-    /// Release the in-flight slot for a swap that spent nothing.
+    /// Release the in-flight slot before execution starts, when the caller can
+    /// prove that no transaction was broadcast.
     ///
     /// Day/IP counters are deliberately kept so a failing swap still consumes
     /// quota (anti retry-spam).
@@ -416,6 +444,17 @@ impl DemoGovernor {
         let mut st = self.lock();
         let reserved = self.policy.max_fee_per_swap_sats.min(st.fee_reserved_sats);
         st.fee_reserved_sats -= reserved;
+        st.in_flight = st.in_flight.saturating_sub(1);
+    }
+
+    /// Release the in-flight slot after execution began but the actual fee is
+    /// unknown. Conservatively charge the full reservation so partial
+    /// broadcasts and crashes cannot escape the persistent ceiling.
+    pub fn fail_closed(&self) {
+        let mut st = self.lock();
+        let reserved = self.policy.max_fee_per_swap_sats.min(st.fee_reserved_sats);
+        st.fee_reserved_sats -= reserved;
+        st.fee_committed_sats = st.fee_committed_sats.saturating_add(reserved);
         st.in_flight = st.in_flight.saturating_sub(1);
     }
 
@@ -428,6 +467,7 @@ impl DemoGovernor {
             swaps_total: st.swaps_total,
             fee_spent_sats: st.fee_spent_sats,
             fee_reserved_sats: st.fee_reserved_sats,
+            fee_committed_sats: st.fee_committed_sats,
             day_index: st.day_index,
             last_start_epoch: st.last_start_epoch,
         }
@@ -436,7 +476,10 @@ impl DemoGovernor {
     /// Remaining whole swaps the fee budget can still fund.
     pub fn swaps_remaining_in_budget(&self) -> u64 {
         let st = self.lock();
-        let used = st.fee_spent_sats + st.fee_reserved_sats;
+        let used = st
+            .fee_spent_sats
+            .saturating_add(st.fee_reserved_sats)
+            .saturating_add(st.fee_committed_sats);
         self.policy
             .fee_budget_sats
             .saturating_sub(used)
@@ -666,15 +709,51 @@ mod tests {
         );
     }
 
-    /// An over-budget actual fee cannot exceed what was reserved.
     #[test]
-    fn actual_fee_clamped_to_reservation() {
+    fn unknown_execution_failure_charges_full_reservation() {
+        let g = DemoGovernor::new(policy());
+        assert!(g.try_admit("5.5.5.5", T0, rich()).is_ok());
+        g.fail_closed();
+        let st = g.status(T0);
+        assert_eq!(st.in_flight, 0);
+        assert_eq!(st.fee_reserved_sats, 0);
+        assert_eq!(
+            st.fee_committed_sats,
+            DEFAULT_MAX_FEE_PER_SWAP_SATS
+        );
+        assert_eq!(st.fee_spent_sats, 0, "actual fee remains unknown");
+    }
+
+    #[test]
+    fn actual_fee_overrun_is_fully_accounted_and_stops_admission() {
+        let g = DemoGovernor::new(DemoSwapPolicy {
+            fee_budget_sats: DEFAULT_MAX_FEE_PER_SWAP_SATS,
+            global_min_interval_secs: 0,
+            ..policy()
+        });
+        assert!(g.try_admit("1.1.1.1", T0, rich()).is_ok());
+        g.finish_with_liability(2_300, 500);
+        let st = g.status(T0);
+        assert_eq!(st.fee_spent_sats, 2_300);
+        assert_eq!(st.fee_committed_sats, 500);
+        assert_eq!(st.fee_reserved_sats, 0);
+        assert_eq!(g.swaps_remaining_in_budget(), 0);
+        assert_eq!(
+            g.try_admit("2.2.2.2", T0 + 1, rich()),
+            Err(DemoDenial::FeeBudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn future_liability_remains_charged_after_success() {
         let g = DemoGovernor::new(policy());
         assert!(g.try_admit("1.1.1.1", T0, rich()).is_ok());
-        g.finish(u64::MAX);
+        g.finish_with_liability(1_300, 500);
         let st = g.status(T0);
-        assert_eq!(st.fee_spent_sats, DEFAULT_MAX_FEE_PER_SWAP_SATS);
+        assert_eq!(st.fee_spent_sats, 1_300);
+        assert_eq!(st.fee_committed_sats, 500);
         assert_eq!(st.fee_reserved_sats, 0);
+        assert_eq!(g.swaps_remaining_in_budget(), 14);
     }
 
     #[test]
@@ -705,6 +784,7 @@ mod tests {
             swaps_total: 40,
             fee_spent_sats: 16_000,
             fee_reserved_sats: 800,
+            fee_committed_sats: 200,
             day_index: T0 / SECS_PER_DAY,
             last_start_epoch: Some(T0),
         });
@@ -712,6 +792,10 @@ mod tests {
         assert_eq!(st.in_flight, 0, "in-flight never survives a restart");
         assert_eq!(st.fee_reserved_sats, 0);
         assert_eq!(st.fee_spent_sats, 16_000, "spend budget is restored");
+        assert_eq!(
+            st.fee_committed_sats, 1_000,
+            "persisted reservations become conservative recovery debits"
+        );
         assert_eq!(st.swaps_today, 4);
     }
 
@@ -848,6 +932,11 @@ mod tests {
         g2.restore(&crashed);
         let st = g2.status(T0 + 2);
         assert_eq!(st.fee_spent_sats, 400, "spend ceiling survived");
+        assert_eq!(
+            st.fee_committed_sats,
+            DEFAULT_MAX_FEE_PER_SWAP_SATS,
+            "crashed reservation remains charged"
+        );
         assert_eq!(st.in_flight, 0, "slot not wedged by the crash");
         // And it can immediately admit again rather than being stuck at capacity.
         assert!(g2.try_admit("3.3.3.3", T0 + 3, rich()).is_ok());

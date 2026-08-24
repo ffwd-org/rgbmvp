@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import codecs
 import contextlib
 import hashlib
 import json
@@ -16,6 +17,7 @@ import socket
 import struct
 import sys
 import time
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import pairwise
@@ -24,13 +26,18 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 SCHEMA = "project-memory:v2"
-BUNDLE_VERSION = "2.3.0"
+BUNDLE_VERSION = "2.4.0"
 GRAPH_SCHEMA = "project-memory:code-graph:v3"
 GRAPH_RECORD_SCHEMA = "project-memory:graph-record:v1"
+CONTENT_ADDRESSED_GRAPH_BUNDLE_SERIES = ("2.3", "2.4")
 EMBEDDING_ID = "feature-hash-sha256-unigram-bigram-v1"
 DIMENSIONS = 384
-DEFAULT_URL = "redis://localhost:6379/0"
+DEFAULT_URL = "redis://127.0.0.1:6379/0"
 URL_ENV = "PROJECT_MEMORY_URL"
+DEPENDENCY_EDGE_KINDS = ("calls", "decorated_by", "imports", "inherits")
+PATH_DIRECTIONS = ("forward", "reverse")
+DEFAULT_PATH_MAX_DEPTH = 8
+MAX_PATH_DEPTH = 100
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 16
 ROOT = Path(__file__).resolve().parents[1]
@@ -246,6 +253,21 @@ def configured_excluded_parts(root: Path = ROOT) -> set[str]:
     return EXCLUDED_PARTS | set(configured)
 
 
+def configured_excluded_paths(root: Path = ROOT) -> set[str]:
+    configured = project_config(root).get("exclude_paths", [])
+    if not isinstance(configured, list) or not all(
+        isinstance(item, str)
+        and item
+        and not item.startswith(("/", "\\"))
+        and ".." not in Path(item).parts
+        for item in configured
+    ):
+        raise ValueError(
+            f"{CONFIG_FILE} exclude_paths must contain repository-relative paths"
+        )
+    return {Path(item).as_posix() for item in configured}
+
+
 def namespace(root: Path = ROOT) -> str:
     return f"{project_slug(root)}:{SCHEMA}"
 
@@ -279,7 +301,12 @@ def is_text_source_path(path: Path) -> bool:
         sample = path.read_bytes()[:TEXT_PROBE_BYTES]
         if b"\x00" in sample:
             return False
-        sample.decode("utf-8")
+        # A bounded sample can end in the middle of a valid multibyte code
+        # point. Incremental strict decoding validates the available bytes
+        # without rejecting that valid boundary split.
+        codecs.getincrementaldecoder("utf-8")(errors="strict").decode(
+            sample, final=False
+        )
     except (OSError, UnicodeDecodeError):
         return False
     return True
@@ -306,11 +333,14 @@ def included_files(root: Path = ROOT) -> list[Path]:
             raise ValueError(f"{CONFIG_FILE} include_patterns must be a string list")
         patterns = tuple(configured)
     excluded_parts = configured_excluded_parts(root)
+    excluded_paths = configured_excluded_paths(root)
     for pattern in patterns:
         paths.extend(path for path in root.glob(pattern) if path.is_file())
     result: list[Path] = []
     for path in sorted(set(paths), key=lambda p: p.relative_to(root).as_posix()):
         rel = path.relative_to(root).as_posix()
+        if rel in excluded_paths:
+            continue
         if any(part in excluded_parts for part in Path(rel).parts):
             continue
         if any(
@@ -1311,7 +1341,9 @@ def _manifest_state(
                 _resolve_graph(expected_graphs)
                 if expected_graphs != embedded_graphs:
                     return current, None
-        elif isinstance(bundle_version, str) and bundle_version.startswith("2.3"):
+        elif isinstance(bundle_version, str) and bundle_version.startswith(
+            CONTENT_ADDRESSED_GRAPH_BUNDLE_SERIES
+        ):
             graph_references = manifest.get("file_graphs")
             if (
                 not isinstance(graph_references, dict)
@@ -1892,6 +1924,228 @@ def impact(client: RedisClient, query: str, limit: int, root: Path = ROOT) -> di
     }
 
 
+def _path_symbol(symbols: list[dict[str, Any]], query: str, role: str) -> dict[str, Any]:
+    normalized = query.strip().lower()
+    if not normalized:
+        raise ValueError(f"{role} symbol query must not be empty")
+
+    qualified_matches = [
+        symbol
+        for symbol in symbols
+        if normalized in {symbol["id"].lower(), symbol["qualified_name"].lower()}
+    ]
+    if len(qualified_matches) == 1:
+        return qualified_matches[0]
+    matches = qualified_matches or [
+        symbol for symbol in symbols if symbol["name"].lower() == normalized
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"{role} symbol not found: {query!r}")
+
+    candidates = sorted(
+        f"{symbol['qualified_name']} ({symbol['path']}:{symbol['start_line']})"
+        for symbol in matches
+    )
+    preview = ", ".join(candidates[:8])
+    if len(candidates) > 8:
+        preview += f", ... ({len(candidates)} matches)"
+    raise ValueError(
+        f"{role} symbol is ambiguous: {query!r}; use a qualified name or symbol id; "
+        f"candidates: {preview}"
+    )
+
+
+def _symbol_result(symbol: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **symbol,
+        "pointer": f"{symbol['path']}:{symbol['start_line']}-{symbol['end_line']}",
+    }
+
+
+def shortest_dependency_path(
+    graphs: dict[str, dict[str, Any]],
+    source_query: str,
+    target_query: str,
+    *,
+    direction: str = "forward",
+    edge_kinds: Iterable[str] | None = None,
+    max_depth: int = DEFAULT_PATH_MAX_DEPTH,
+    include_probable: bool = False,
+) -> dict[str, Any]:
+    """Find a deterministic minimum-hop path over resolved dependency edges."""
+    if direction not in PATH_DIRECTIONS:
+        raise ValueError(f"direction must be one of: {', '.join(PATH_DIRECTIONS)}")
+    if type(max_depth) is not int or not 0 <= max_depth <= MAX_PATH_DEPTH:
+        raise ValueError(f"max_depth must be between 0 and {MAX_PATH_DEPTH}")
+    if edge_kinds is None:
+        selected_edge_kinds = set(DEPENDENCY_EDGE_KINDS)
+    else:
+        if isinstance(edge_kinds, str):
+            raise ValueError("edge_kinds must be an iterable of edge kind names")
+        selected_edge_kinds = set(edge_kinds)
+        if not selected_edge_kinds:
+            raise ValueError("edge_kinds must contain at least one edge kind")
+        unknown_edge_kinds = selected_edge_kinds - set(DEPENDENCY_EDGE_KINDS)
+        if unknown_edge_kinds:
+            raise ValueError(
+                "unsupported edge kinds: " + ", ".join(sorted(unknown_edge_kinds))
+            )
+
+    _resolve_graph(graphs)
+    all_symbols = [
+        symbol
+        for graph in graphs.values()
+        for symbol in graph.get("symbols", [])
+    ]
+    symbols_by_id = {symbol["id"]: symbol for symbol in all_symbols}
+    source = _path_symbol(all_symbols, source_query, "source")
+    target = _path_symbol(all_symbols, target_query, "target")
+    source_id = source["id"]
+    target_id = target["id"]
+
+    adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    eligible_edges = 0
+    for graph in graphs.values():
+        for edge in graph.get("edges", []):
+            if edge.get("kind") not in selected_edge_kinds:
+                continue
+            resolution = edge.get("resolution", {})
+            resolved_target_id = resolution.get("target_id")
+            if not isinstance(resolved_target_id, str):
+                continue
+            confidence = resolution.get("confidence")
+            if confidence != "strong" and not (
+                include_probable and confidence == "probable"
+            ):
+                continue
+            resolved_source_id = edge.get("source_id")
+            if (
+                resolved_source_id not in symbols_by_id
+                or resolved_target_id not in symbols_by_id
+            ):
+                continue
+            if direction == "forward":
+                start_id, end_id = resolved_source_id, resolved_target_id
+            else:
+                start_id, end_id = resolved_target_id, resolved_source_id
+            adjacency.setdefault(start_id, []).append((end_id, edge))
+            eligible_edges += 1
+
+    def adjacency_key(item: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
+        neighbor_id, edge = item
+        neighbor = symbols_by_id[neighbor_id]
+        return (
+            neighbor["qualified_name"].lower(),
+            neighbor["path"],
+            neighbor["start_line"],
+            edge["kind"],
+            edge["path"],
+            edge["line"],
+        )
+
+    for neighbors in adjacency.values():
+        neighbors.sort(key=adjacency_key)
+
+    depths = {source_id: 0}
+    previous: dict[str, tuple[str, dict[str, Any]]] = {}
+    frontier = deque([source_id])
+    while frontier:
+        current_id = frontier.popleft()
+        if current_id == target_id:
+            break
+        if depths[current_id] >= max_depth:
+            continue
+        for neighbor_id, edge in adjacency.get(current_id, []):
+            if neighbor_id in depths:
+                continue
+            depths[neighbor_id] = depths[current_id] + 1
+            previous[neighbor_id] = (current_id, edge)
+            frontier.append(neighbor_id)
+
+    result = {
+        "source_query": source_query,
+        "target_query": target_query,
+        "source": _symbol_result(source),
+        "target": _symbol_result(target),
+        "direction": direction,
+        "edge_kinds": sorted(selected_edge_kinds),
+        "include_probable": include_probable,
+        "max_depth": max_depth,
+        "algorithm": "breadth-first-search",
+        "eligible_edges": eligible_edges,
+        "visited_symbols": len(depths),
+    }
+    if target_id not in depths:
+        return {
+            **result,
+            "found": False,
+            "hop_count": None,
+            "path": [],
+            "steps": [],
+        }
+
+    path_ids = [target_id]
+    path_edges = []
+    while path_ids[-1] != source_id:
+        parent_id, edge = previous[path_ids[-1]]
+        path_ids.append(parent_id)
+        path_edges.append(edge)
+    path_ids.reverse()
+    path_edges.reverse()
+
+    steps = []
+    for start_id, end_id, edge in zip(
+        path_ids[:-1], path_ids[1:], path_edges, strict=True
+    ):
+        steps.append(
+            {
+                "from": _symbol_result(symbols_by_id[start_id]),
+                "to": _symbol_result(symbols_by_id[end_id]),
+                "edge": {**edge, "resolution": dict(edge["resolution"])},
+                "pointer": f"{edge['path']}:{edge['line']}",
+            }
+        )
+    return {
+        **result,
+        "found": True,
+        "hop_count": len(path_edges),
+        "path": [_symbol_result(symbols_by_id[symbol_id]) for symbol_id in path_ids],
+        "steps": steps,
+    }
+
+
+def dependency_path(
+    client: RedisClient,
+    source_query: str,
+    target_query: str,
+    *,
+    direction: str = "forward",
+    edge_kinds: Iterable[str] | None = None,
+    max_depth: int = DEFAULT_PATH_MAX_DEPTH,
+    include_probable: bool = False,
+    root: Path = ROOT,
+) -> dict[str, Any]:
+    """Load the current graph and return a read-only shortest dependency path."""
+    state, fresh = status(client, root)
+    if not fresh:
+        raise ValueError(f"index is {state['status']}; run index before path lookup")
+    graphs = _load_manifest_graphs(client, state["manifest"], root)
+    return {
+        "fresh": True,
+        **shortest_dependency_path(
+            graphs,
+            source_query,
+            target_query,
+            direction=direction,
+            edge_kinds=edge_kinds,
+            max_depth=max_depth,
+            include_probable=include_probable,
+        ),
+    }
+
+
 def evaluate(client: RedisClient, limit: int, root: Path = ROOT) -> dict[str, Any]:
     cases = project_config(root).get("evaluation_queries", [])
     if not isinstance(cases, list) or not cases:
@@ -1988,6 +2242,7 @@ def clear(client: RedisClient, root: Path = ROOT) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--version", action="version", version=BUNDLE_VERSION)
     configured_url = next(
         (os.environ[name] for name in redis_url_envs() if os.environ.get(name)), DEFAULT_URL
     )
@@ -2024,6 +2279,29 @@ def parser() -> argparse.ArgumentParser:
     impact_parser = commands.add_parser("impact")
     impact_parser.add_argument("query")
     impact_parser.add_argument("--limit", type=int, default=20)
+    path_parser = commands.add_parser(
+        "path", help="find a minimum-hop path over resolved dependency edges"
+    )
+    path_parser.add_argument("source")
+    path_parser.add_argument("target")
+    path_parser.add_argument(
+        "--direction", choices=PATH_DIRECTIONS, default="forward"
+    )
+    path_parser.add_argument(
+        "--edge-kind",
+        dest="edge_kinds",
+        action="append",
+        choices=DEPENDENCY_EDGE_KINDS,
+        help="restrict traversal to an edge kind; repeat to select multiple kinds",
+    )
+    path_parser.add_argument(
+        "--max-depth", type=int, default=DEFAULT_PATH_MAX_DEPTH
+    )
+    path_parser.add_argument(
+        "--include-probable",
+        action="store_true",
+        help="include heuristic unique-name resolutions in addition to strong links",
+    )
     evaluate_parser = commands.add_parser("evaluate")
     evaluate_parser.add_argument("--limit", type=int, default=10)
     commands.add_parser("clear")
@@ -2056,6 +2334,22 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--limit must be between 1 and 100")
             lookup = {"search": search, "symbols": symbols, "impact": impact}[args.command]
             print(json.dumps(lookup(client, args.query, args.limit), sort_keys=True))
+            return 0
+        if args.command == "path":
+            print(
+                json.dumps(
+                    dependency_path(
+                        client,
+                        args.source,
+                        args.target,
+                        direction=args.direction,
+                        edge_kinds=args.edge_kinds,
+                        max_depth=args.max_depth,
+                        include_probable=args.include_probable,
+                    ),
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.command == "evaluate":
             if args.limit < 1 or args.limit > 100:

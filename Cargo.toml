@@ -40,6 +40,7 @@ lab-rgb = { path = "crates/lab-rgb" }
 lab-btc = { path = "crates/lab-btc" }
 lab-simplicity = { path = "crates/lab-simplicity" }
 hex = "0.4"
+getrandom = "0.3"
 bitcoin = { version = "0.32", features = ["std", "serde"] }
 # U5 labd
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time"] }

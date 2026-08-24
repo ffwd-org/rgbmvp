@@ -1,5 +1,10 @@
 # T1 — live swap evidence
 
+> Historical security note (2026-08-13): these runs predate the secret-backed
+> exit-key remediation. Their role labels and addresses describe the legacy
+> `sha256(public_label)` scheme and must not be reused as a current runbook.
+> Legacy outputs must be swept before enabling the remediated T1 profile.
+
 Two live swaps, both complete:
 
 | # | Session | Path | Result |
@@ -162,15 +167,23 @@ failure the retry loop exists for. Both resolved on the next 60 s poll.
 
 ## 8. Governor behaviour observed live
 
+> Historical evidence: this run used the earlier 1,300-sat reservation and
+> proved persistence only after successful completion. It did not exercise a
+> crash while a reservation was in flight. The later 1,800-sat write-ahead
+> model and its pending deployment drill are documented in
+> [T1_FEE_BUDGET_REMEDIATION.md](./T1_FEE_BUDGET_REMEDIATION.md).
+
 | Moment | `in_flight` | `reserved` | `spent` | `remaining_est` |
 |---|---|---|---|---|
 | Mid-swap | 1 | 1,300 | 0 | 20 |
 | After completion | 0 | 0 | 1,300 | 20 |
 
 The W2 worst-case reservation converted cleanly into actual spend, and the
-in-flight slot released. **W4 persistence confirmed live**: after completion
-`.rgbmvp/demo_budget.json` held `fee_spent_sats: 1300`, so the ceiling now
-survives a restart.
+in-flight slot released. **Completed-state W4 persistence was observed live**:
+after completion
+`.rgbmvp/demo_budget.json` held `fee_spent_sats: 1300`, so completed spend
+survived a restart. This did not establish crash durability for an in-flight
+reservation.
 
 **Preimage redaction held throughout.** While the swap was mid-flight the public
 `GET /v1/swap/{id}` returned `preimage_hex: null`, `preimage_redacted: true`.
@@ -271,7 +284,8 @@ Sweeping would have destroyed value, so it correctly declined.
 - Cross-chain preimage extraction from a Liquid witness.
 - The **W1 automated driver**, including retry recovery from an unconfirmed-UTXO
   wait and an Esplora propagation race.
-- W2 reservation → spend accounting; W4 persistence across two restarts.
+- W2 reservation → spend accounting; completed-state W4 persistence across two
+  restarts (not an in-flight crash drill).
 - The **W5 refund watcher**, CSV refund path, and recycle-after-refund.
 - Demo-exit sweep on **both** chains, and its dust guard.
 - Preimage redaction on the public view, mid-flight.

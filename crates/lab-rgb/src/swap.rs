@@ -130,6 +130,7 @@ impl SwapStore {
 }
 
 pub fn init_swap(
+    keyring: &htlc::DemoKeyring,
     id: &str,
     csv_delay: u32,
     alice_btc_wallet: &str,
@@ -149,9 +150,11 @@ pub fn init_swap(
     let hash = htlc::sha256_preimage(&preimage);
 
     // BTC: Bob claims Alice's locked coins; Alice refunds after CSV
-    let htlc_btc = htlc::build_htlc_addresses(&hash, "bob-claimer", "alice-refund", csv_delay)?;
+    let htlc_btc =
+        htlc::build_htlc_addresses(keyring, &hash, "bob-claimer", "alice-refund", csv_delay)?;
     // LQ: Alice claims Bob's locked L-BTC; Bob refunds after CSV
-    let htlc_lq = htlc::build_htlc_addresses(&hash, "alice-claimer", "bob-refund", csv_delay)?;
+    let htlc_lq =
+        htlc::build_htlc_addresses(keyring, &hash, "alice-claimer", "bob-refund", csv_delay)?;
 
     let btc_rgb = btc_contract_id.as_ref().map(|cid| SwapLegRgb {
         contract_id: cid.clone(),
@@ -340,6 +343,7 @@ mod tests {
 
     fn dual_wrap_session() -> SwapSession {
         init_swap(
+            &htlc::test_keyring(),
             "s3-neg",
             6,
             "btc-alice",
@@ -374,7 +378,17 @@ mod tests {
 
     #[test]
     fn value_only_done_without_rgb_fields() {
-        let mut s = init_swap("vo", 6, "btc-alice", "bob", None, None, false).unwrap();
+        let mut s = init_swap(
+            &htlc::test_keyring(),
+            "vo",
+            6,
+            "btc-alice",
+            "bob",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(!s.rgb_wrap);
         mark_value_claims_complete(&mut s);
         assert_eq!(s.phase, SwapPhase::Done);
@@ -462,7 +476,17 @@ mod tests {
 
     #[test]
     fn rgb_done_requires_verify_when_wrap() {
-        let mut s = init_swap("x", 6, "btc-alice", "bob", Some("c1".into()), None, true).unwrap();
+        let mut s = init_swap(
+            &htlc::test_keyring(),
+            "x",
+            6,
+            "btc-alice",
+            "bob",
+            Some("c1".into()),
+            None,
+            true,
+        )
+        .unwrap();
         s.btc_fund_txid = Some("a".into());
         s.lq_fund_txid = Some("b".into());
         s.lq_claim_txid = Some("c".into());
@@ -481,7 +505,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rgbmvp-swap-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = SwapStore::new(&dir);
-        let s = init_swap("id1", 6, "a", "b", None, None, false).unwrap();
+        let s = init_swap(
+            &htlc::test_keyring(),
+            "id1",
+            6,
+            "a",
+            "b",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         store.save(&s).unwrap();
         let loaded = store.load("id1").unwrap();
         assert_eq!(loaded.preimage_hex, s.preimage_hex);

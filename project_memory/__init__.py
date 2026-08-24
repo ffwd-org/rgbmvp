@@ -1,5 +1,7 @@
-"""Portable Project Memory v2 package."""
+"""Portable Project Memory package."""
 
-from .core import main
+from .core import BUNDLE_VERSION, main
 
-__all__ = ["main"]
+__version__ = BUNDLE_VERSION
+
+__all__ = ["__version__", "main"]

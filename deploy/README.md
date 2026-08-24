@@ -190,8 +190,11 @@ Deploys `deploy/cloudrun-demo.yaml` — the **only** profile where the public ca
 trigger a state change. It holds spendable **testnet** keys. Read
 [`docs/TESTNET_PUBLIC_SWAPS.md`](../docs/TESTNET_PUBLIC_SWAPS.md) first.
 
-**Rollback at any point:** redeploy `deploy/cloudrun.yaml` (the read-only
-freeze). One revision removes the keys, the volume, and the public mutation.
+**Rollback:** first disable admission on `rgbmvp-demo`. After active sessions
+are finished/refunded and all exits are swept, replace that same service with
+`deploy/cloudrun-demo-freeze.yaml`. The publication manifest
+`deploy/cloudrun.yaml` names the separate `rgbmvp-public` service and cannot
+roll back T1.
 
 Run these yourself and paste the output back; none need `sudo`.
 
@@ -199,6 +202,7 @@ Run these yourself and paste the output back; none need `sudo`.
 export PROJECT=silicon-pointer-490721-r0     # your project
 export REGION=us-central1
 export BUCKET="${PROJECT}-rgbmvp-demo-data"
+export IMAGE_TAG=REVIEWED_SHA                  # same reviewed image as T1
 ```
 
 ### 5.1 Enable APIs and create the runtime identity
@@ -211,10 +215,31 @@ gcloud iam service-accounts create rgbmvp-demo-run \
   --display-name="rgbmvp T1 demo runtime (testnet keys)" --project "$PROJECT"
 ```
 
+The rollback profile switches to `rgbmvp-public-run`. Before enabling T1,
+confirm that account exists, that the deployer may act as it, and that it has
+no project, demo-bucket, or demo-secret access. Create it with no roles if this
+project has not deployed the publication freeze before:
+
+```bash
+gcloud iam service-accounts describe \
+  "rgbmvp-public-run@${PROJECT}.iam.gserviceaccount.com" --project "$PROJECT"
+# If absent only:
+gcloud iam service-accounts create rgbmvp-public-run \
+  --display-name="rgbmvp read-only runtime (no privileges)" --project "$PROJECT"
+```
+
 ### 5.2 Persistent state bucket (W4)
 
-Without this the fee budget resets on every restart and the run can overshoot
-its ceiling. Versioning on, so a bad write is recoverable.
+Admission is fail-closed until its 1,800-sat worst-case reservation is durable.
+The data mount is therefore mandatory; corrupt or unavailable budget state
+refuses T1 startup rather than resetting the ceiling. Object versioning makes
+operator deletion or a bad external write recoverable. See
+[`docs/T1_FEE_BUDGET_REMEDIATION.md`](../docs/T1_FEE_BUDGET_REMEDIATION.md).
+
+The application uses a synced pending object followed by a synced primary
+object; it does not rely on rename semantics. This matches Cloud Storage FUSE's
+documented non-POSIX behavior, but the isolated T1 deployment still requires
+the interruption drill in the remediation record before public exposure.
 
 ```bash
 gcloud storage buckets create "gs://${BUCKET}" \
@@ -226,10 +251,11 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --role=roles/storage.objectAdmin
 ```
 
-### 5.3 Wallet secrets (W3)
+### 5.3 Wallet and exit-key secrets (W3)
 
-The demo signs with **btc-alice** (WIF) and **bob** (mnemonic). Startup refuses
-to run if these are not mounted on a public bind.
+The demo signs with **btc-alice** (WIF), **bob** (mnemonic), and a dedicated
+256-bit root seed for the four HTLC exit keys. Startup refuses to run if any is
+not mounted on a public bind.
 
 > Pipe from your local files — do **not** paste key material into shell history.
 > These are testnet keys with a small float, but treat them as real anyway.
@@ -245,11 +271,16 @@ gcloud secrets create rgbmvp-demo-bob-mnemonic --project "$PROJECT" \
 gcloud secrets versions add rgbmvp-demo-bob-mnemonic --project "$PROJECT" \
   --data-file=.rgbmvp/wallets/bob/mnemonic
 
+# Generate the demo-exit root without placing it in a shell variable or file.
+# Never reuse a wallet seed or a production/mainnet secret here.
+openssl rand -hex 32 | gcloud secrets create rgbmvp-demo-exit-seed \
+  --project "$PROJECT" --replication-policy=automatic --data-file=-
+
 # Turnstile secret (from the Cloudflare dashboard).
 printf '%s' "$TURNSTILE_SECRET" | gcloud secrets create rgbmvp-demo-turnstile-secret \
   --project "$PROJECT" --replication-policy=automatic --data-file=-
 
-for S in rgbmvp-demo-btc-alice-wif rgbmvp-demo-bob-mnemonic rgbmvp-demo-turnstile-secret; do
+for S in rgbmvp-demo-btc-alice-wif rgbmvp-demo-bob-mnemonic rgbmvp-demo-exit-seed rgbmvp-demo-turnstile-secret; do
   gcloud secrets add-iam-policy-binding "$S" --project "$PROJECT" \
     --member="serviceAccount:rgbmvp-demo-run@${PROJECT}.iam.gserviceaccount.com" \
     --role=roles/secretmanager.secretAccessor
@@ -299,24 +330,73 @@ fix the mount before proceeding.
 
 ### 5.6 Kill switch
 
-Instant: flip the flag off (keeps the revision otherwise identical).
+First response: flip the flag off on the **T1 service** and explicitly route
+all traffic to that new revision. Cloud Run traffic changes are not
+instantaneous; requests already in flight may complete, so verify the quota
+endpoint before treating admission as stopped.
 
 ```bash
 gcloud run services update rgbmvp-demo --project "$PROJECT" --region "$REGION" \
   --update-env-vars=LABD_DEMO_SWAPS=0
+gcloud run services update-traffic rgbmvp-demo --project "$PROJECT" \
+  --region "$REGION" --to-latest
+
+URL=$(gcloud run services describe rgbmvp-demo --project "$PROJECT" \
+  --region "$REGION" --format='value(status.url)')
+curl -fsS "$URL/v1/demo/quota" | jq -e '.enabled == false'
 ```
 
-Full rollback to the read-only freeze:
+Do not remove custody from an active watcher: finish or refund every active
+`demo-*` session, sweep all four exits, and independently confirm their
+balances are zero. If key compromise requires an immediate freeze, accept and
+record that exits may need recovery with retained secret versions.
+
+Full rollback then replaces **`rgbmvp-demo`**, not `rgbmvp-public`. Render the
+same-service freeze profile with the reviewed image tag, assert its target, and
+route 100% of traffic to the new revision even if a prior traffic split exists:
 
 ```bash
-gcloud run services replace deploy/cloudrun.yaml --project "$PROJECT" --region "$REGION"
+sed -e "s/PROJECT/${PROJECT}/g" -e "s/REGION/${REGION}/g" \
+  -e "s/TAG/${IMAGE_TAG}/g" deploy/cloudrun-demo-freeze.yaml \
+  > /tmp/rgbmvp-demo-freeze.yaml
+grep -q '^  name: rgbmvp-demo$' /tmp/rgbmvp-demo-freeze.yaml
+
+gcloud run services replace /tmp/rgbmvp-demo-freeze.yaml \
+  --project "$PROJECT" --region "$REGION"
+gcloud run services update-traffic rgbmvp-demo --project "$PROJECT" \
+  --region "$REGION" --to-latest
 ```
 
+Verify `metadata.name=rgbmvp-demo`, the no-role `rgbmvp-public-run` service
+account, no volumes or secret references, and no demo flag in the active
+template. Then repeat the read-only security smoke:
+
+```bash
+gcloud run services describe rgbmvp-demo --project "$PROJECT" --region "$REGION" \
+  --format='yaml(metadata.name,spec.template.spec.serviceAccountName,spec.template.spec.volumes,spec.template.spec.containers[0].env,status.traffic)'
+curl -fsS "$URL/v1/security" | jq -e '.public_read_only == true'
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$URL/v1/demo/swap" \
+  -H 'content-type: application/json' -d '{}'
+# expect 404; also confirm the latest revision receives 100% traffic
+```
+
+This changes the active revision of `rgbmvp-demo`; it does not delete the
+independent `rgbmvp-public` service, old zero-traffic revisions, or the retained
+T1 bucket/secrets. Remove or revoke those only as a separately approved cleanup
+after recovery evidence is complete.
+
 ### 5.7 Key rotation
+
+First disable T1, finish or refund every active demo session, sweep all four
+current exit addresses, and independently verify their balances are zero.
+Rotating earlier makes the current seed unavailable to the watcher and strands
+its outputs. Retain the prior Secret Manager version until that check passes.
 
 ```bash
 gcloud secrets versions add rgbmvp-demo-bob-mnemonic --project "$PROJECT" \
   --data-file=/path/to/new/mnemonic
+openssl rand -hex 32 | gcloud secrets versions add rgbmvp-demo-exit-seed \
+  --project "$PROJECT" --data-file=-
 gcloud run services update rgbmvp-demo --project "$PROJECT" --region "$REGION"  # restart to remount
 ```
 

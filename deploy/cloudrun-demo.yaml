@@ -13,13 +13,16 @@
 #   min 0 / max 1                   min 1 / max 1            <-- refund watcher must keep running
 #   runtime SA: no roles            runtime SA: secretAccessor + storage on ONE bucket
 #
-# ROLLBACK = redeploy deploy/cloudrun.yaml. That single step removes the keys,
-# the volume, and the public mutation in one revision.
+# FULL ROLLBACK = replace this SAME service with
+# deploy/cloudrun-demo-freeze.yaml, then route 100% of traffic to latest.
+# deploy/cloudrun.yaml names a different service (rgbmvp-public) and cannot
+# roll back rgbmvp-demo.
 #
 # Mainnet is refused at config load regardless of anything here.
 #
 # Prerequisites (see deploy/README.md "T1 demo swap deployment"):
-#   - Secret Manager: rgbmvp-demo-btc-alice-wif, rgbmvp-demo-bob-mnemonic
+#   - Secret Manager: rgbmvp-demo-btc-alice-wif, rgbmvp-demo-bob-mnemonic,
+#     rgbmvp-demo-exit-seed
 #   - GCS bucket for the persistent volume (versioning ON)
 #   - Turnstile secret: rgbmvp-demo-turnstile-secret
 #   - Runtime SA rgbmvp-demo-run@PROJECT.iam.gserviceaccount.com
@@ -69,8 +72,15 @@ spec:
               - key: latest
                 path: bob/mnemonic
                 mode: 0400
-        # W4 — persistent state. Without this the fee budget resets on every
-        # restart and the run can overshoot its ceiling.
+        - name: demo-exit-seed
+          secret:
+            secretName: rgbmvp-demo-exit-seed
+            items:
+              - key: latest
+                path: demo-exits/seed
+                mode: 0400
+        # W4 — persistent state for write-ahead reservations and sessions.
+        # Corrupt or unavailable budget state makes T1 refuse startup.
         - name: demo-data
           csi:
             driver: gcsfuse.run.googleapis.com
@@ -88,6 +98,9 @@ spec:
             - name: wallet-secrets-lq
               mountPath: /secrets-lq
               readOnly: true
+            - name: demo-exit-seed
+              mountPath: /secrets-exits
+              readOnly: true
             - name: demo-data
               mountPath: /data
           env:
@@ -100,7 +113,7 @@ spec:
               value: /app/web
             - name: LABD_ARTIFACTS_DIR
               value: /app/artifacts/public
-            # --- W4: persistent state (NOT /tmp) ---
+            # --- W4: persistent, write-ahead state (NOT /tmp) ---
             - name: RGBMVP_DATA_DIR
               value: /data
             - name: RGBMVP_WALLET_DIR
@@ -112,7 +125,7 @@ spec:
             # Colon-separated: Cloud Run gives each Secret Manager entry its own
             # volume/mountPath, so one directory cannot hold both keys. ---
             - name: RGBMVP_SECRET_DIR
-              value: /secrets:/secrets-lq
+              value: /secrets:/secrets-lq:/secrets-exits
             # --- T1: the bounded public trigger ---
             - name: LABD_DEMO_SWAPS
               value: "1"
@@ -127,9 +140,11 @@ spec:
                 secretKeyRef:
                   name: rgbmvp-demo-turnstile-secret
                   key: latest
-            # Per-IP quotas: Cloud Run fronts us, so the rightmost
-            # X-Forwarded-For entry is the real client.
-            - name: LABD_TRUST_XFF
+            # Google External Application Load Balancers append
+            # client-ip,load-balancer-ip. Discard the one trusted right-edge
+            # proxy entry and select the next-to-last IP. Verify this exact
+            # topology during acceptance; direct/unexpected paths fail closed.
+            - name: LABD_XFF_TRUSTED_HOPS
               value: "1"
             # --- Budget (docs/TESTNET_PUBLIC_SWAPS.md §1a) ---
             - name: LABD_DEMO_LEG_SATS
@@ -141,12 +156,14 @@ spec:
               value: "800"
             - name: LABD_DEMO_BTC_CLAIM_FEE_SATS
               value: "500"
+            - name: LABD_DEMO_BTC_SWEEP_FEE_SATS
+              value: "500"
             - name: LABD_DEMO_LQ_FEE_SATS
               value: "300"
-            # MUST be >= BTC_FEE + BTC_CLAIM_FEE or the budget under-reserves
-            # (labd warns at startup if it is).
+            # MUST cover fund + claim/refund + exit sweep. labd refuses an
+            # under-reserving configuration at startup.
             - name: LABD_DEMO_MAX_FEE_SATS
-              value: "1300"
+              value: "1800"
             - name: LABD_DEMO_FEE_BUDGET_SATS
               value: "28000"
             - name: LABD_DEMO_DAILY_CAP

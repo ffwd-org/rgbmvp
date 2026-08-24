@@ -87,7 +87,18 @@ mod tests {
 
     #[test]
     fn public_view_never_exposes_preimage() {
-        let s = init_swap("p", 6, "a", "b", Some("c".into()), None, true).unwrap();
+        let keyring = lab_rgb::htlc::DemoKeyring::new([0x42; 32]).unwrap();
+        let s = init_swap(
+            &keyring,
+            "p",
+            6,
+            "a",
+            "b",
+            Some("c".into()),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(!s.preimage_hex.is_empty());
         let v = public_swap_view(&s, "https://lq.example", "https://btc.example");
         assert!(v.get("preimage_hex").unwrap().is_null());

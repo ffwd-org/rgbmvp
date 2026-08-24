@@ -1,0 +1,57 @@
+# Cloud Run — same-service read-only freeze for the T1 rgbmvp-demo service.
+#
+# This is the FULL ROLLBACK target for deploy/cloudrun-demo.yaml. Both manifests
+# intentionally use metadata.name=rgbmvp-demo. The publication freeze manifest
+# deploy/cloudrun.yaml names rgbmvp-public and therefore cannot roll back T1.
+#
+# Before applying: replace PROJECT, REGION, and TAG with the exact reviewed
+# values. After applying, explicitly route rgbmvp-demo traffic to latest and
+# verify the active template has no volumes, secret references, or demo flag.
+# Mainnet remains out of scope.
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: rgbmvp-demo
+  annotations:
+    run.googleapis.com/description: "rgbmvp T1 rollback — read-only freeze"
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      # Switch away from the T1 identity. This account must have no project
+      # roles and must not have access to the demo bucket or secrets.
+      serviceAccountName: rgbmvp-public-run@PROJECT.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 60
+      # Deliberately no volumes and no volumeMounts.
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT/rgbmvp/rgbmvp-public:TAG
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            - name: LABD_PUBLIC_READ_ONLY
+              value: "1"
+            - name: RGBMVP_NETWORK
+              value: liquid-testnet
+            - name: LABD_WEB_DIR
+              value: /app/web
+            - name: LABD_ARTIFACTS_DIR
+              value: /app/artifacts/public
+            - name: RGBMVP_DATA_DIR
+              value: /tmp/rgbmvp-demo-freeze
+            - name: LABD_VERIFY_RATE_LIMIT
+              value: "30"
+            # Deliberately no LABD_DEMO_SWAPS, API token, wallet paths,
+            # secretKeyRef, Turnstile secret, trusted-proxy setting, or watcher.
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi

@@ -41,6 +41,7 @@ impl SwapService {
 
     pub fn init(
         &self,
+        cfg: &Config,
         id: &str,
         csv_delay: u32,
         alice_btc_wallet: &str,
@@ -49,7 +50,9 @@ impl SwapService {
         lq_contract_id: Option<String>,
         rgb_wrap: bool,
     ) -> Result<SwapSession> {
+        let keyring = lab_rgb::htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
         let session = swap::init_swap(
+            &keyring,
             id,
             csv_delay,
             alice_btc_wallet,
@@ -140,6 +143,7 @@ impl SwapService {
             hex::decode(&s.preimage_hex)?
         };
         s3::claim_btc(
+            cfg,
             &self.rgb_store(),
             s,
             &preimage,
@@ -195,8 +199,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rgbmvp-svc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let svc = SwapService::new(&dir);
+        let mut cfg = Config::load().unwrap();
+        cfg.data_dir = dir.clone();
+        cfg.wallet_dir = dir.join("wallets");
+        cfg.consignment_dir = dir.join("consignments");
+        cfg.ensure_dirs().unwrap();
         let s = svc
             .init(
+                &cfg,
                 "svc1",
                 6,
                 "btc-alice",

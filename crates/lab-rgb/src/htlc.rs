@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use bitcoin::absolute::LockTime;
+use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::key::Secp256k1;
@@ -82,14 +83,95 @@ pub fn p2wsh_address(network_hrp: &str, witness_script: &[u8]) -> Result<String>
     segwit::encode(hrp, v0, wsh.as_byte_array()).map_err(|e| anyhow::anyhow!("bech32: {e}"))
 }
 
-/// Deterministic demo key from label (testnet only).
-pub fn demo_keypair(label: &str) -> Result<(SecretKey, [u8; 33])> {
-    let secp = Secp256k1::new();
-    let sk_bytes = sha256::Hash::hash(label.as_bytes());
-    let sk = SecretKey::from_slice(sk_bytes.as_byte_array())
-        .context("invalid secret from label hash")?;
-    let pk = PublicKey::from_secret_key(&secp, &sk);
-    Ok((sk, pk.serialize()))
+/// Version recorded in sessions created with custody-backed exit keys.
+pub const DEMO_EXIT_KEY_SCHEME: &str = "bip32-hardened-v1";
+
+fn legacy_exit_key_scheme() -> String {
+    "legacy-public-label-v0".into()
+}
+
+/// T1 exit-key root. Its seed is never serialized or exposed through `/v1`.
+#[derive(Clone)]
+pub struct DemoKeyring {
+    seed: [u8; 32],
+    key_id: String,
+}
+
+impl DemoKeyring {
+    pub fn new(seed: [u8; 32]) -> Result<Self> {
+        let mut keyring = Self {
+            seed,
+            key_id: String::new(),
+        };
+        let (_, pk) = keyring.derive_raw("rgbmvp/t1/key-id")?;
+        keyring.key_id = hex::encode(&sha256::Hash::hash(&pk).to_byte_array()[..8]);
+        Ok(keyring)
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    fn derive_raw(&self, label: &str) -> Result<(SecretKey, [u8; 33])> {
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(bitcoin::Network::Testnet, &self.seed)
+            .context("derive T1 BIP32 master key")?;
+
+        // Four hardened indices provide 124 bits of domain-separated label
+        // space. Public child material cannot derive siblings or the root.
+        let mut domain = b"rgbmvp/t1/demo-exit/v1\0".to_vec();
+        domain.extend_from_slice(label.as_bytes());
+        let digest = sha256::Hash::hash(&domain).to_byte_array();
+        let mut path = Vec::with_capacity(4);
+        for chunk in digest[..16].chunks_exact(4) {
+            let index = u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"))
+                & 0x7fff_ffff;
+            path.push(
+                ChildNumber::from_hardened_idx(index)
+                    .context("construct hardened T1 BIP32 child")?,
+            );
+        }
+        let child = master
+            .derive_priv(&secp, &DerivationPath::from(path))
+            .context("derive hardened T1 exit key")?;
+        let sk = child.private_key;
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        Ok((sk, pk.serialize()))
+    }
+
+    pub fn derive(&self, label: &str) -> Result<(SecretKey, [u8; 33])> {
+        if label.trim().is_empty() {
+            bail!("demo exit key label must not be empty");
+        }
+        self.derive_raw(label)
+    }
+
+    /// Refuse legacy sessions and sessions created under a different seed.
+    pub fn derive_for_session(
+        &self,
+        info: &HtlcAddressInfo,
+        label: &str,
+    ) -> Result<(SecretKey, [u8; 33])> {
+        if info.exit_key_scheme != DEMO_EXIT_KEY_SCHEME {
+            bail!(
+                "swap uses unsupported exit-key scheme {:?}; drain legacy exits before upgrade",
+                info.exit_key_scheme
+            );
+        }
+        if info.exit_key_id != self.key_id {
+            bail!(
+                "swap exit-key id {} does not match mounted key id {}; restore the original seed",
+                info.exit_key_id,
+                self.key_id
+            );
+        }
+        self.derive(label)
+    }
+}
+
+#[cfg(test)]
+pub fn test_keyring() -> DemoKeyring {
+    DemoKeyring::new([0x42; 32]).expect("valid test keyring")
 }
 
 pub fn sha256_preimage(preimage: &[u8]) -> [u8; 32] {
@@ -102,6 +184,10 @@ pub struct HtlcAddressInfo {
     pub csv_delay: u32,
     pub claimer_label: String,
     pub refund_label: String,
+    #[serde(default = "legacy_exit_key_scheme")]
+    pub exit_key_scheme: String,
+    #[serde(default)]
+    pub exit_key_id: String,
     pub witness_script_hex: String,
     pub spk_hex: String,
     pub address_btc: String,
@@ -109,19 +195,22 @@ pub struct HtlcAddressInfo {
 }
 
 pub fn build_htlc_addresses(
+    keyring: &DemoKeyring,
     hash: &[u8; 32],
     claimer_label: &str,
     refund_label: &str,
     csv_delay: u32,
 ) -> Result<HtlcAddressInfo> {
-    let (_, claimer_pk) = demo_keypair(claimer_label)?;
-    let (_, refund_pk) = demo_keypair(refund_label)?;
+    let (_, claimer_pk) = keyring.derive(claimer_label)?;
+    let (_, refund_pk) = keyring.derive(refund_label)?;
     let ws = htlc_witness_script(hash, &claimer_pk, &refund_pk, csv_delay);
     Ok(HtlcAddressInfo {
         hash_hex: hex::encode(hash),
         csv_delay,
         claimer_label: claimer_label.into(),
         refund_label: refund_label.into(),
+        exit_key_scheme: DEMO_EXIT_KEY_SCHEME.into(),
+        exit_key_id: keyring.key_id().into(),
         witness_script_hex: hex::encode(&ws),
         spk_hex: hex::encode(p2wsh_spk(&ws)),
         address_btc: p2wsh_address("tb", &ws)?,
@@ -284,10 +373,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exit_keys_require_the_secret_seed() {
+        let label = "bob-claimer";
+        let a = DemoKeyring::new([0x11; 32]).unwrap();
+        let a_again = DemoKeyring::new([0x11; 32]).unwrap();
+        let b = DemoKeyring::new([0x22; 32]).unwrap();
+
+        let (a_sk, a_pk) = a.derive(label).unwrap();
+        let (same_sk, same_pk) = a_again.derive(label).unwrap();
+        let (b_sk, b_pk) = b.derive(label).unwrap();
+        assert_eq!(a_sk.secret_bytes(), same_sk.secret_bytes());
+        assert_eq!(a_pk, same_pk);
+        assert_ne!(a_sk.secret_bytes(), b_sk.secret_bytes());
+        assert_ne!(a_pk, b_pk);
+        assert_ne!(a.key_id(), b.key_id());
+
+        // Regression: the old construction made sha256(public_label) the key.
+        let public_label_key =
+            SecretKey::from_slice(sha256::Hash::hash(label.as_bytes()).as_byte_array()).unwrap();
+        assert_ne!(a_sk.secret_bytes(), public_label_key.secret_bytes());
+    }
+
+    #[test]
+    fn exit_key_labels_are_domain_separated() {
+        let keyring = test_keyring();
+        let (claim, _) = keyring.derive("bob-claimer").unwrap();
+        let (refund, _) = keyring.derive("alice-refund").unwrap();
+        assert_ne!(claim.secret_bytes(), refund.secret_bytes());
+    }
+
+    #[test]
+    fn sessions_reject_legacy_or_rotated_exit_keys() {
+        let current = DemoKeyring::new([0x11; 32]).unwrap();
+        let rotated = DemoKeyring::new([0x22; 32]).unwrap();
+        let mut info = build_htlc_addresses(&current, &[0x42; 32], "claimer", "refund", 6)
+            .unwrap();
+
+        assert!(current.derive_for_session(&info, "claimer").is_ok());
+        let rotated_err = rotated.derive_for_session(&info, "claimer").unwrap_err();
+        assert!(rotated_err.to_string().contains("does not match mounted key id"));
+
+        info.exit_key_scheme = legacy_exit_key_scheme();
+        info.exit_key_id.clear();
+        let legacy_err = current.derive_for_session(&info, "claimer").unwrap_err();
+        assert!(legacy_err.to_string().contains("unsupported exit-key scheme"));
+    }
+
+    #[test]
+    fn legacy_json_fails_closed_without_key_metadata() {
+        let keyring = test_keyring();
+        let info = build_htlc_addresses(&keyring, &[0x42; 32], "claimer", "refund", 6)
+            .unwrap();
+        let mut value = serde_json::to_value(&info).unwrap();
+        value.as_object_mut().unwrap().remove("exit_key_scheme");
+        value.as_object_mut().unwrap().remove("exit_key_id");
+        let legacy: HtlcAddressInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.exit_key_scheme, "legacy-public-label-v0");
+        assert!(keyring.derive_for_session(&legacy, "claimer").is_err());
+    }
+
+    #[test]
     fn htlc_deterministic() {
         let h = [0x42u8; 32];
-        let a = build_htlc_addresses(&h, "claimer", "refund", 6).unwrap();
-        let b = build_htlc_addresses(&h, "claimer", "refund", 6).unwrap();
+        let keyring = test_keyring();
+        let a = build_htlc_addresses(&keyring, &h, "claimer", "refund", 6).unwrap();
+        let b = build_htlc_addresses(&keyring, &h, "claimer", "refund", 6).unwrap();
         assert_eq!(a.address_btc, b.address_btc);
         assert!(a.address_btc.starts_with("tb1q"));
     }
@@ -351,8 +501,9 @@ mod tests {
     #[test]
     fn multi_out_btc_claim_builds() {
         let h = [0x42u8; 32];
-        let info = build_htlc_addresses(&h, "claimer", "refund", 6).unwrap();
-        let (sk, _) = demo_keypair("claimer").unwrap();
+        let keyring = test_keyring();
+        let info = build_htlc_addresses(&keyring, &h, "claimer", "refund", 6).unwrap();
+        let (sk, _) = keyring.derive("claimer").unwrap();
         let pre = [0x11u8; 32];
         let ws = hex::decode(&info.witness_script_hex).unwrap();
         let dest = p2wsh_spk(&ws); // reuse as dummy dest
@@ -378,8 +529,9 @@ mod tests {
     #[test]
     fn refund_btc_witness_rejects_preimage_extract() {
         let h = [0x42u8; 32];
-        let info = build_htlc_addresses(&h, "claimer", "refund", 6).unwrap();
-        let (sk, _) = demo_keypair("refund").unwrap();
+        let keyring = test_keyring();
+        let info = build_htlc_addresses(&keyring, &h, "claimer", "refund", 6).unwrap();
+        let (sk, _) = keyring.derive("refund").unwrap();
         let ws = hex::decode(&info.witness_script_hex).unwrap();
         let dest = p2wsh_spk(&ws);
         let hex_tx = build_htlc_spend_btc(
@@ -406,8 +558,9 @@ mod tests {
     #[test]
     fn multi_out_liquid_claim_extracts_preimage() {
         let h = [0x42u8; 32];
-        let info = build_htlc_addresses(&h, "claimer", "refund", 6).unwrap();
-        let (sk, _) = demo_keypair("claimer").unwrap();
+        let keyring = test_keyring();
+        let info = build_htlc_addresses(&keyring, &h, "claimer", "refund", 6).unwrap();
+        let (sk, _) = keyring.derive("claimer").unwrap();
         let pre = [0x22u8; 32];
         let ws = hex::decode(&info.witness_script_hex).unwrap();
         let dest = p2wsh_spk(&ws);

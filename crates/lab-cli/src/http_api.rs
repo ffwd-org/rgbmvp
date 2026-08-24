@@ -310,7 +310,9 @@ pub(crate) fn handle_swap_init_post(
         anyhow::bail!("swap {id} already exists; pass force:true to overwrite");
     }
     let rgb_wrap = v.get("rgb_wrap").and_then(|x| x.as_bool()).unwrap_or(false);
+    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
     let session = swap::init_swap(
+        &keyring,
         &id,
         csv_delay,
         &alice_btc,
@@ -320,7 +322,6 @@ pub(crate) fn handle_swap_init_post(
         rgb_wrap,
     )?;
     let path = store.save(&session)?;
-    let _ = cfg;
     Ok(serde_json::json!({
         "status": "created",
         "stored": path.display().to_string(),
@@ -646,7 +647,9 @@ pub(crate) fn handle_swap_action_post(
                 &s.htlc_btc.address_btc,
                 amount.saturating_sub(1),
             )?;
-            let (refund_sk, _) = htlc::demo_keypair(&s.htlc_btc.refund_label)?;
+            let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
+            let (refund_sk, _) =
+                keyring.derive_for_session(&s.htlc_btc, &s.htlc_btc.refund_label)?;
             let ws = hex::decode(&s.htlc_btc.witness_script_hex)?;
             use bitcoin::key::{CompressedPublicKey, Secp256k1};
             use bitcoin::{Address, Network};
@@ -688,7 +691,9 @@ pub(crate) fn handle_swap_action_post(
                 &s.htlc_lq.address_liquid_unconf,
                 amount.saturating_sub(1),
             )?;
-            let (refund_sk, _) = htlc::demo_keypair(&s.htlc_lq.refund_label)?;
+            let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
+            let (refund_sk, _) =
+                keyring.derive_for_session(&s.htlc_lq, &s.htlc_lq.refund_label)?;
             let ws = hex::decode(&s.htlc_lq.witness_script_hex)?;
             use bitcoin::key::{CompressedPublicKey, Secp256k1};
             use bitcoin::{Address, Network};

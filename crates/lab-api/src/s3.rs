@@ -88,11 +88,13 @@ impl ClaimVerifier for BtcClaimIo<'_> {
 
 /// Demo claimer P2WPKH (testnet) for HTLC claim outputs.
 pub fn claimer_p2wpkh_spk(
+    keyring: &htlc::DemoKeyring,
+    info: &htlc::HtlcAddressInfo,
     label: &str,
 ) -> Result<(bitcoin::secp256k1::SecretKey, bitcoin::ScriptBuf, String)> {
     use bitcoin::key::{CompressedPublicKey, Secp256k1};
     use bitcoin::{Address, Network};
-    let (sk, _) = htlc::demo_keypair(label)?;
+    let (sk, _) = keyring.derive_for_session(info, label)?;
     let secp = Secp256k1::new();
     let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
     let compressed = CompressedPublicKey(pk);
@@ -266,6 +268,7 @@ pub fn fund_wrap_lq(
 
 /// Value-only Liquid HTLC claim (P1 path).
 pub fn claim_lq_value(cfg: &Config, s: &mut SwapSession, fee_sats: u64) -> Result<Value> {
+    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
     let amount = s.lq_fund_sats.context("lq not funded (run fund-lq)")?;
     let (txid, vout, value) = lab_chain::find_address_utxo(
         cfg,
@@ -277,7 +280,8 @@ pub fn claim_lq_value(cfg: &Config, s: &mut SwapSession, fee_sats: u64) -> Resul
     s.lq_fund_sats = Some(value);
 
     let preimage = hex::decode(&s.preimage_hex)?;
-    let (claimer_sk, dest_spk, dest_addr) = claimer_p2wpkh_spk(&s.htlc_lq.claimer_label)?;
+    let (claimer_sk, dest_spk, dest_addr) =
+        claimer_p2wpkh_spk(&keyring, &s.htlc_lq, &s.htlc_lq.claimer_label)?;
     let ws = hex::decode(&s.htlc_lq.witness_script_hex)?;
     let out_sats = value.saturating_sub(fee_sats);
     let raw = htlc::build_htlc_spend_liquid(
@@ -318,6 +322,7 @@ pub fn claim_lq_rgb(
     commitment_sats: u64,
     entropy: u64,
 ) -> Result<Value> {
+    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
     lab_rgb::swap::require_fund_wrap_for_claim(s.lq_rgb.as_ref(), "lq")?;
     let leg = s.lq_rgb.as_ref().expect("checked").clone();
     lab_rgb::swap::check_leg_contract_matches_session(&leg, s.lq_contract_id.as_deref(), "lq")?;
@@ -365,7 +370,8 @@ pub fn claim_lq_rgb(
 
     let commit_spk = hex::decode(&plan.commitment_spk_hex)?;
     let preimage = hex::decode(&s.preimage_hex)?;
-    let (claimer_sk, dest_spk, dest_addr) = claimer_p2wpkh_spk(&s.htlc_lq.claimer_label)?;
+    let (claimer_sk, dest_spk, dest_addr) =
+        claimer_p2wpkh_spk(&keyring, &s.htlc_lq, &s.htlc_lq.claimer_label)?;
     let ws = hex::decode(&s.htlc_lq.witness_script_hex)?;
     if commitment_sats + fee_sats >= value {
         anyhow::bail!("commitment+fee must be < HTLC value");
@@ -439,11 +445,18 @@ pub fn claim_lq(
 }
 
 /// Value-only BTC HTLC claim (P1 path).
-pub fn claim_btc_value(s: &mut SwapSession, preimage: &[u8], fee_sats: u64) -> Result<Value> {
+pub fn claim_btc_value(
+    cfg: &Config,
+    s: &mut SwapSession,
+    preimage: &[u8],
+    fee_sats: u64,
+) -> Result<Value> {
+    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
     let btc = lab_btc::BtcConfig::from_env();
     let amount = s.btc_fund_sats.context("btc_fund_sats")?;
     let utxo = lab_btc::find_htlc_utxo(&btc, &s.htlc_btc.address_btc, amount.saturating_sub(1))?;
-    let (claimer_sk, dest_spk, dest_addr) = claimer_p2wpkh_spk(&s.htlc_btc.claimer_label)?;
+    let (claimer_sk, dest_spk, dest_addr) =
+        claimer_p2wpkh_spk(&keyring, &s.htlc_btc, &s.htlc_btc.claimer_label)?;
     let ws = hex::decode(&s.htlc_btc.witness_script_hex)?;
     let out_sats = utxo.value_sats.saturating_sub(fee_sats);
     let raw = htlc::build_htlc_spend_btc(
@@ -471,6 +484,7 @@ pub fn claim_btc_value(s: &mut SwapSession, preimage: &[u8], fee_sats: u64) -> R
 
 /// S3 RGB-wrapped BTC claim.
 pub fn claim_btc_rgb(
+    cfg: &Config,
     rgb_store: &RgbStore,
     s: &mut SwapSession,
     preimage: &[u8],
@@ -478,6 +492,7 @@ pub fn claim_btc_rgb(
     commitment_sats: u64,
     entropy: u64,
 ) -> Result<Value> {
+    let keyring = htlc::DemoKeyring::new(cfg.demo_exit_seed()?)?;
     let btc = lab_btc::BtcConfig::from_env();
     lab_rgb::swap::require_fund_wrap_for_claim(s.btc_rgb.as_ref(), "btc")?;
     let leg = s.btc_rgb.as_ref().expect("checked").clone();
@@ -517,7 +532,8 @@ pub fn claim_btc_rgb(
     rgb_store.save_transfer(&plan_id, &plan)?;
 
     let commit_spk = hex::decode(&plan.commitment_spk_hex)?;
-    let (claimer_sk, dest_spk, dest_addr) = claimer_p2wpkh_spk(&s.htlc_btc.claimer_label)?;
+    let (claimer_sk, dest_spk, dest_addr) =
+        claimer_p2wpkh_spk(&keyring, &s.htlc_btc, &s.htlc_btc.claimer_label)?;
     let ws = hex::decode(&s.htlc_btc.witness_script_hex)?;
     if commitment_sats + fee_sats >= utxo.value_sats {
         anyhow::bail!("commitment+fee must be < HTLC value");
@@ -570,6 +586,7 @@ pub fn claim_btc_rgb(
 
 /// Dispatch BTC claim: RGB wrap when session has `rgb_wrap` + btc contract.
 pub fn claim_btc(
+    cfg: &Config,
     rgb_store: &RgbStore,
     s: &mut SwapSession,
     preimage: &[u8],
@@ -578,9 +595,17 @@ pub fn claim_btc(
     entropy: u64,
 ) -> Result<Value> {
     if s.rgb_wrap && s.btc_contract_id.is_some() {
-        claim_btc_rgb(rgb_store, s, preimage, fee_sats, commitment_sats, entropy)
+        claim_btc_rgb(
+            cfg,
+            rgb_store,
+            s,
+            preimage,
+            fee_sats,
+            commitment_sats,
+            entropy,
+        )
     } else {
-        claim_btc_value(s, preimage, fee_sats)
+        claim_btc_value(cfg, s, preimage, fee_sats)
     }
 }
 

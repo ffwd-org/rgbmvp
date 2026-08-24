@@ -12,7 +12,7 @@
 //!
 //! See `docs/TESTNET_PUBLIC_SWAPS.md` (ADR-T1).
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -63,9 +63,9 @@ impl DemoWallets {
 /// ~200 sats derived from vbyte arithmetic; that is ~1.4 sat/vB and risks
 /// sitting unconfirmed. Measure on a live run before lowering these.
 ///
-/// The BTC leg spends two transactions (fund + claim), so a swap's BTC fee is
-/// `btc_fund_fee_sats + btc_claim_fee_sats`; keep `LABD_DEMO_MAX_FEE_SATS`
-/// at or above that sum.
+/// The BTC leg spends funding and claim/refund transactions, then the watcher
+/// sweeps the controlled exit. Keep `LABD_DEMO_MAX_FEE_SATS` at or above all
+/// three fees.
 #[derive(Debug, Clone, Copy)]
 pub struct DemoFees {
     /// Fee for the BTC funding transaction.
@@ -74,6 +74,8 @@ pub struct DemoFees {
     pub lq_sweep_fee_sats: u64,
     /// Fee for the BTC claim/refund transaction.
     pub btc_claim_fee_sats: u64,
+    /// Fee retained in the budget for the later BTC demo-exit sweep.
+    pub btc_sweep_fee_sats: u64,
     pub lq_fee_sats: u64,
 }
 
@@ -82,14 +84,27 @@ impl DemoFees {
         Self {
             btc_fee_sats: env_u64("LABD_DEMO_BTC_FEE_SATS", 800),
             btc_claim_fee_sats: env_u64("LABD_DEMO_BTC_CLAIM_FEE_SATS", 500),
+            btc_sweep_fee_sats: env_u64("LABD_DEMO_BTC_SWEEP_FEE_SATS", 500),
             lq_fee_sats: env_u64("LABD_DEMO_LQ_FEE_SATS", 300),
             lq_sweep_fee_sats: env_u64("LABD_DEMO_LQ_SWEEP_FEE_SATS", 400),
         }
     }
 
-    /// Total BTC fee a completed swap burns (fund + claim).
-    pub fn btc_total_per_swap(&self) -> u64 {
-        self.btc_fee_sats + self.btc_claim_fee_sats
+    /// Refuse T1 when its admission reservation cannot cover every configured
+    /// BTC transaction fee controlled by one swap.
+    pub fn validate_reservation(&self, max_fee_per_swap_sats: u64) -> Result<()> {
+        let required = u128::from(self.btc_fee_sats)
+            + u128::from(self.btc_claim_fee_sats)
+            + u128::from(self.btc_sweep_fee_sats);
+        anyhow::ensure!(
+            required <= u128::from(max_fee_per_swap_sats),
+            "configured BTC fees ({required} = {} fund + {} claim/refund + {} sweep) \
+             exceed LABD_DEMO_MAX_FEE_SATS ({max_fee_per_swap_sats})",
+            self.btc_fee_sats,
+            self.btc_claim_fee_sats,
+            self.btc_sweep_fee_sats
+        );
+        Ok(())
     }
 }
 
@@ -280,6 +295,7 @@ pub fn create_demo_session(
     let id = new_demo_swap_id(seq);
     lab_core::validate_path_id(&id).context("generated demo swap id must be path-safe")?;
     svc.init(
+        cfg,
         &id,
         policy.csv_delay,
         &wallets.alice_btc,
@@ -391,59 +407,123 @@ pub fn budget_path(cfg: &Config) -> std::path::PathBuf {
     cfg.data_dir.join("demo_budget.json")
 }
 
-/// Load persisted budget counters, if any.
-///
-/// A missing or unreadable file is not an error: the caller starts from zero.
-/// A *corrupt* file is reported so the operator notices rather than silently
-/// resetting the spend ceiling.
-pub fn load_budget(cfg: &Config) -> Option<lab_core::DemoStatus> {
-    let p = budget_path(cfg);
-    let bytes = std::fs::read(&p).ok()?;
-    match serde_json::from_slice::<lab_core::DemoStatus>(&bytes) {
-        Ok(st) => Some(st),
-        Err(e) => {
-            eprintln!(
-                "demo: budget file {} is unreadable ({e}); starting from zero \
-                 — the fee ceiling for this run is effectively reset",
-                p.display()
-            );
-            None
+fn budget_pending_path(cfg: &Config) -> std::path::PathBuf {
+    cfg.data_dir.join("demo_budget.pending.json")
+}
+
+fn budget_io_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn read_budget_file(path: &std::path::Path) -> Result<lab_core::DemoStatus> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read demo budget {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse demo budget {}", path.display()))
+}
+
+fn load_budget_unlocked(cfg: &Config) -> Result<Option<lab_core::DemoStatus>> {
+    let pending = budget_pending_path(cfg);
+    match std::fs::metadata(&pending) {
+        Ok(_) => {
+            // A pending record is written and synced before the primary file.
+            // Its presence means the prior commit was interrupted, so it is
+            // the only safe recovery source. Invalid data is fatal.
+            return read_budget_file(&pending).map(Some);
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("stat demo budget {}", pending.display()));
+        }
+    }
+
+    let primary = budget_path(cfg);
+    match std::fs::metadata(&primary) {
+        Ok(_) => read_budget_file(&primary).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat demo budget {}", primary.display())),
     }
 }
 
-/// Persist budget counters atomically (write temp + rename), so a crash mid-write
-/// cannot leave a truncated file that would silently reset the spend ceiling.
-pub fn save_budget(cfg: &Config, st: &lab_core::DemoStatus) -> Result<()> {
+/// Load persisted budget counters. Missing state is allowed only for initial
+/// creation; unreadable or malformed state is a startup-blocking error.
+pub fn load_budget(cfg: &Config) -> Result<Option<lab_core::DemoStatus>> {
+    let _guard = budget_io_lock().lock().unwrap_or_else(|e| e.into_inner());
+    load_budget_unlocked(cfg)
+}
+
+fn write_budget_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open demo budget {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write demo budget {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync demo budget {}", path.display()))
+}
+
+fn save_budget_unlocked(cfg: &Config, st: &lab_core::DemoStatus) -> Result<()> {
     let p = budget_path(cfg);
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir).context("create data dir for demo budget")?;
-    }
-    let tmp = p.with_extension("json.tmp");
+    let dir = p.parent().context("demo budget path has no parent")?;
+    std::fs::create_dir_all(dir).context("create data dir for demo budget")?;
+    let pending = budget_pending_path(cfg);
     let bytes = serde_json::to_vec_pretty(st).context("serialize demo budget")?;
-    std::fs::write(&tmp, &bytes).context("write demo budget temp")?;
-    std::fs::rename(&tmp, &p).context("rename demo budget into place")?;
+
+    // Write-ahead protocol: pending is durable before primary is touched. A
+    // crash at any point leaves either the old primary, a valid newer pending,
+    // or an invalid pending that blocks startup instead of resetting to zero.
+    write_budget_file(&pending, &bytes)?;
+    write_budget_file(&p, &bytes)?;
+    std::fs::remove_file(&pending).context("remove committed demo budget pending record")?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .context("open demo budget directory for sync")?
+        .sync_all()
+        .context("sync demo budget directory")?;
     Ok(())
 }
 
-/// Snapshot the governor and persist it; logs rather than propagating, since a
-/// persistence failure must not abort an otherwise healthy swap.
-pub fn persist_budget(cfg: &Config, gov: &lab_core::DemoGovernor) {
-    let st = gov.status(now_epoch());
-    if let Err(e) = save_budget(cfg, &st) {
-        eprintln!("demo: failed to persist budget: {e:#}");
-    }
+/// Persist one explicit snapshot using the serialized write-ahead protocol.
+pub fn save_budget(cfg: &Config, st: &lab_core::DemoStatus) -> Result<()> {
+    let _guard = budget_io_lock().lock().unwrap_or_else(|e| e.into_inner());
+    save_budget_unlocked(cfg, st)
 }
 
-/// Restore persisted counters into a fresh governor at startup.
-pub fn restore_budget(cfg: &Config, gov: &lab_core::DemoGovernor) {
-    if let Some(st) = load_budget(cfg) {
+/// Snapshot the governor while holding the I/O serialization lock, so an older
+/// snapshot can never overwrite a newer concurrent admission or settlement.
+pub fn persist_budget(cfg: &Config, gov: &lab_core::DemoGovernor) -> Result<()> {
+    let _guard = budget_io_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let st = gov.status(now_epoch());
+    save_budget_unlocked(cfg, &st)
+}
+
+/// Restore persisted counters into a fresh governor at startup. Recovered
+/// reservations become conservative commitments, then the normalized state is
+/// durably committed before the public endpoint can accept traffic.
+pub fn restore_budget(cfg: &Config, gov: &lab_core::DemoGovernor) -> Result<()> {
+    let _guard = budget_io_lock().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = load_budget_unlocked(cfg)? {
         gov.restore(&st);
+        let recovered = gov.status(now_epoch());
+        save_budget_unlocked(cfg, &recovered)?;
         eprintln!(
-            "  T1 demo budget restored: spent={}sats swaps_total={} today={}",
-            st.fee_spent_sats, st.swaps_total, st.swaps_today
+            "  T1 demo budget restored: spent={}sats committed={}sats swaps_total={} today={}",
+            recovered.fee_spent_sats,
+            recovered.fee_committed_sats,
+            recovered.swaps_total,
+            recovered.swaps_today
         );
+    } else {
+        // Establish the durable zero state before serving the first request.
+        save_budget_unlocked(cfg, &gov.status(now_epoch()))?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -564,10 +644,9 @@ fn needs_lq_refund(s: &lab_rgb::swap::SwapSession) -> bool {
 /// Refund stuck demo swaps, then sweep the recovered value back to the funder.
 ///
 /// IMPORTANT: an HTLC refund does **not** pay the funding wallet. Both refund
-/// and claim paths pay a P2WPKH address derived from `demo_keypair(<label>)`
-/// (`sha256(label)`) — four fixed addresses in total. Without the sweep below,
-/// `btc-alice` drains on every swap regardless of outcome and the value strands
-/// there. The keys are deterministic, so this is recovery, not rescue.
+/// and claim paths pay one of four P2WPKH addresses derived from the secret
+/// demo-exit seed and a public role label. Without the sweep below, `btc-alice`
+/// drains on every swap regardless of outcome and the value strands there.
 ///
 /// **Blocking and network-bound**: run on a blocking task. Failures are counted
 /// and retried on the next sweep — a refund rejected because the CSV window has
@@ -657,7 +736,7 @@ pub fn sweep_stuck_demo_swaps_blocking(
     // Recover value from the demo exit addresses back into the funding wallet.
     // Runs every sweep, not only when a refund fired: completed swaps also pay
     // out to `bob-claimer` and would otherwise strand there.
-    report.recycled_sats = recycle_btc_exits_blocking(cfg, wallets, fees.btc_claim_fee_sats);
+    report.recycled_sats = recycle_btc_exits_blocking(cfg, wallets, fees.btc_sweep_fee_sats);
     report.recycled_lq_sats = recycle_lq_exits_blocking(cfg, wallets, fees.lq_sweep_fee_sats);
     report
 }
@@ -696,6 +775,10 @@ pub fn quota_json(gov: &DemoGovernor, floats: Option<Floats>) -> Value {
             "fee_budget_sats": p.fee_budget_sats,
             "fee_spent_sats": st.fee_spent_sats,
             "fee_reserved_sats": st.fee_reserved_sats,
+            "fee_committed_sats": st.fee_committed_sats,
+            "fee_accounted_sats": st.fee_spent_sats
+                .saturating_add(st.fee_reserved_sats)
+                .saturating_add(st.fee_committed_sats),
             "swaps_remaining_est": gov.swaps_remaining_in_budget(),
         },
         "usage": {
@@ -716,6 +799,30 @@ pub fn quota_json(gov: &DemoGovernor, floats: Option<Floats>) -> Value {
 mod tests {
     use super::*;
 
+    fn test_fees() -> DemoFees {
+        DemoFees {
+            btc_fee_sats: 800,
+            btc_claim_fee_sats: 500,
+            btc_sweep_fee_sats: 500,
+            lq_fee_sats: 300,
+            lq_sweep_fee_sats: 400,
+        }
+    }
+
+    #[test]
+    fn fee_reservation_validation_fails_closed() {
+        let fees = test_fees();
+        assert!(fees.validate_reservation(1_800).is_ok());
+        assert!(fees.validate_reservation(1_799).is_err());
+
+        let overflowing = DemoFees {
+            btc_fee_sats: u64::MAX,
+            btc_claim_fee_sats: 1,
+            ..fees
+        };
+        assert!(overflowing.validate_reservation(u64::MAX).is_err());
+    }
+
     #[test]
     fn demo_swap_ids_are_path_safe() {
         for seq in [0u64, 1, 42, 99_999] {
@@ -730,7 +837,7 @@ mod tests {
     /// The driver must never emit an RGB-wrapped or oversized leg.
     #[test]
     fn driver_steps_are_value_only_and_fixed() {
-        let steps = driver_steps(1_000, DemoFees { btc_fee_sats: 800, btc_claim_fee_sats: 500, lq_fee_sats: 300, lq_sweep_fee_sats: 400 });
+        let steps = driver_steps(1_000, test_fees());
         assert_eq!(steps.len(), 4);
         for (name, payload) in &steps {
             assert_eq!(
@@ -751,7 +858,7 @@ mod tests {
 
     #[test]
     fn driver_steps_follow_htlc_order() {
-        let steps = driver_steps(1_000, DemoFees { btc_fee_sats: 800, btc_claim_fee_sats: 500, lq_fee_sats: 300, lq_sweep_fee_sats: 400 });
+        let steps = driver_steps(1_000, test_fees());
         let names: Vec<&str> = steps.iter().map(|(n, _)| *n).collect();
         // Alice must claim Liquid (revealing the preimage) before Bob claims BTC.
         assert_eq!(names, vec!["fund_btc", "fund_lq", "claim_lq", "claim_btc"]);
@@ -843,7 +950,18 @@ mod tests {
     #[test]
     fn refund_eligibility_matches_htlc_state() {
         use lab_rgb::swap::init_swap;
-        let mut s = init_swap("demo-1-0", 6, "btc-alice", "bob", None, None, false).unwrap();
+        let keyring = lab_rgb::htlc::DemoKeyring::new([0x42; 32]).unwrap();
+        let mut s = init_swap(
+            &keyring,
+            "demo-1-0",
+            6,
+            "btc-alice",
+            "bob",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         // Nothing funded yet: nothing to recover.
         assert!(!needs_btc_refund(&s));
         assert!(!needs_lq_refund(&s));
@@ -869,7 +987,7 @@ mod tests {
         cfg.data_dir = dir.clone();
 
         // Nothing persisted yet.
-        assert!(load_budget(&cfg).is_none());
+        assert!(load_budget(&cfg).unwrap().is_none());
 
         let gov = lab_core::DemoGovernor::new(lab_core::DemoSwapPolicy {
             enabled: true,
@@ -882,10 +1000,10 @@ mod tests {
         )
         .expect("admit");
         gov.finish(400);
-        persist_budget(&cfg, &gov);
+        persist_budget(&cfg, &gov).unwrap();
 
         // A fresh governor (simulating a restart) recovers the spend.
-        let reloaded = load_budget(&cfg).expect("budget file written");
+        let reloaded = load_budget(&cfg).unwrap().expect("budget file written");
         assert_eq!(reloaded.fee_spent_sats, 400);
         assert_eq!(reloaded.swaps_total, 1);
 
@@ -893,7 +1011,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        restore_budget(&cfg, &gov2);
+        restore_budget(&cfg, &gov2).unwrap();
         let st = gov2.status(now_epoch());
         assert_eq!(st.fee_spent_sats, 400, "spend ceiling survived the restart");
         assert_eq!(st.in_flight, 0, "in-flight never survives a restart");
@@ -905,16 +1023,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A corrupt budget file must not crash startup (it degrades to zero, loudly).
+    /// Corrupt primary state blocks startup instead of resetting the ceiling.
     #[test]
-    fn corrupt_budget_file_is_survivable() {
+    fn corrupt_budget_file_fails_closed() {
         let dir = std::env::temp_dir().join(format!("rgbmvp-demo-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = Config::load().expect("config");
         cfg.data_dir = dir.clone();
         std::fs::write(budget_path(&cfg), b"{ this is not json").unwrap();
-        assert!(load_budget(&cfg).is_none());
+        assert!(load_budget(&cfg).is_err());
+        let gov = lab_core::DemoGovernor::new(lab_core::DemoSwapPolicy {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(restore_budget(&cfg, &gov).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unavailable_budget_storage_is_an_error() {
+        let root = std::env::temp_dir().join(format!(
+            "rgbmvp-demo-budget-unavailable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let not_a_directory = root.join("data");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let mut cfg = Config::load().expect("config");
+        cfg.data_dir = not_a_directory;
+        let gov = lab_core::DemoGovernor::new(lab_core::DemoSwapPolicy {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(persist_budget(&cfg, &gov).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A synced pending record is the safe recovery point if the process dies
+    /// before the primary write completes.
+    #[test]
+    fn pending_budget_record_wins_after_interrupted_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "rgbmvp-demo-pending-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::load().expect("config");
+        cfg.data_dir = dir.clone();
+
+        let old = lab_core::DemoStatus {
+            fee_spent_sats: 100,
+            ..Default::default()
+        };
+        save_budget(&cfg, &old).unwrap();
+        let pending = lab_core::DemoStatus {
+            fee_spent_sats: 500,
+            ..Default::default()
+        };
+        std::fs::write(
+            budget_pending_path(&cfg),
+            serde_json::to_vec_pretty(&pending).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(load_budget(&cfg).unwrap().unwrap().fee_spent_sats, 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_pending_record_blocks_fallback_to_primary() {
+        let dir = std::env::temp_dir().join(format!(
+            "rgbmvp-demo-pending-bad-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config::load().expect("config");
+        cfg.data_dir = dir.clone();
+        save_budget(&cfg, &lab_core::DemoStatus::default()).unwrap();
+        std::fs::write(budget_pending_path(&cfg), b"truncated").unwrap();
+        assert!(load_budget(&cfg).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact reported defect: a crash after durable admission must consume
+    /// a full reservation after restart even if completion never persisted.
+    #[test]
+    fn admitted_reservation_is_crash_durable() {
+        let dir = std::env::temp_dir().join(format!(
+            "rgbmvp-demo-admit-crash-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config::load().expect("config");
+        cfg.data_dir = dir.clone();
+        let policy = lab_core::DemoSwapPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        let gov = lab_core::DemoGovernor::new(policy.clone());
+        gov.try_admit(
+            "1.1.1.1",
+            now_epoch(),
+            Some(lab_core::Floats {
+                btc_sats: 33_607,
+                lq_sats: 146_633,
+            }),
+        )
+        .unwrap();
+        persist_budget(&cfg, &gov).unwrap();
+
+        let restarted = lab_core::DemoGovernor::new(policy);
+        restore_budget(&cfg, &restarted).unwrap();
+        let st = restarted.status(now_epoch());
+        assert_eq!(st.in_flight, 0);
+        assert_eq!(st.fee_reserved_sats, 0);
+        assert_eq!(
+            st.fee_committed_sats,
+            lab_core::demo::DEFAULT_MAX_FEE_PER_SWAP_SATS
+        );
+        let expected = (lab_core::demo::DEFAULT_FEE_BUDGET_SATS
+            - lab_core::demo::DEFAULT_MAX_FEE_PER_SWAP_SATS)
+            / lab_core::demo::DEFAULT_MAX_FEE_PER_SWAP_SATS;
+        assert_eq!(restarted.swaps_remaining_in_budget(), expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -932,6 +1165,9 @@ mod tests {
         );
         for path in [
             ("budget", "fee_spent_sats"),
+            ("budget", "fee_reserved_sats"),
+            ("budget", "fee_committed_sats"),
+            ("budget", "fee_accounted_sats"),
             ("budget", "fee_budget_sats"),
             ("budget", "swaps_remaining_est"),
             ("usage", "in_flight"),
@@ -978,9 +1214,9 @@ mod tests {
         let expected = lab_core::demo::DEFAULT_FEE_BUDGET_SATS
             / lab_core::demo::DEFAULT_MAX_FEE_PER_SWAP_SATS;
         assert_eq!(v["budget"]["swaps_remaining_est"], json!(expected));
-        // At repo-proven fees (800 fund + 500 claim) the run is ~21 swaps,
-        // not the ~70 an earlier 400-sat estimate implied.
-        assert_eq!(expected, 21);
+        // Funding, claim/refund, and sweep consume 1,800 sats of accounting
+        // capacity per admission, so the 28,000-sat run admits at most 15.
+        assert_eq!(expected, 15);
         assert_eq!(v["floats"]["btc_sats"], json!(33_607));
     }
 }

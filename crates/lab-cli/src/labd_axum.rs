@@ -3,7 +3,7 @@
 //! Same `/v1` shapes and U4 security as the legacy TCP server; mutations call
 //! shared `http_api` handlers (often via `spawn_blocking` for LWK I/O).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,6 +46,8 @@ struct AppState {
     demo_floats: Arc<FloatCache>,
     demo_wallets: DemoWallets,
     demo_fees: DemoFees,
+    /// Exact number of trusted proxy entries at the right edge of XFF.
+    client_ip_policy: ClientIpPolicy,
     /// Monotonic counter feeding demo swap ids.
     demo_seq: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -82,6 +84,8 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         std::env::var("LABD_ARTIFACTS_DIR").unwrap_or_else(|_| "artifacts/public".into()),
     );
     let demo = Arc::new(DemoGovernor::from_env());
+    let client_ip_policy =
+        ClientIpPolicy::from_env().context("invalid client-IP proxy trust configuration")?;
     if demo.enabled() {
         let p = demo.policy();
         eprintln!(
@@ -93,6 +97,7 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
             p.fee_budget_sats,
             demo.swaps_remaining_in_budget()
         );
+        eprintln!("  T1 client IP: {}", client_ip_policy.description());
         if !p.turnstile_required {
             eprintln!("  WARNING: demo swaps running WITHOUT bot protection (local/testing only)");
         }
@@ -100,16 +105,8 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         // fees we actually pay exceed that, the reservation under-counts and the
         // run can overshoot its ceiling.
         let fees = DemoFees::from_env();
-        if fees.btc_total_per_swap() > p.max_fee_per_swap_sats {
-            eprintln!(
-                "  WARNING: BTC fees per swap ({} = {} fund + {} claim) exceed \
-                 LABD_DEMO_MAX_FEE_SATS ({}); the fee budget will under-reserve",
-                fees.btc_total_per_swap(),
-                fees.btc_fee_sats,
-                fees.btc_claim_fee_sats,
-                p.max_fee_per_swap_sats
-            );
-        }
+        fees.validate_reservation(p.max_fee_per_swap_sats)
+            .context("T1 refused: budget reservation would be unsound")?;
         // W3: refuse to sign with image-baked or over-permissive key material.
         // Public = anything not bound to loopback, or explicitly read-only mode.
         let wallets = DemoWallets::from_env();
@@ -117,6 +114,10 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         let required = vec![
             (wallets.alice_btc.clone(), lab_core::KIND_WIF.to_string()),
             (wallets.bob_lq.clone(), lab_core::KIND_MNEMONIC.to_string()),
+            (
+                lab_core::DEMO_EXIT_SECRET_NAME.to_string(),
+                lab_core::KIND_EXIT_SEED.to_string(),
+            ),
         ];
         let issues = lab_core::custody::preflight(&lab_core::CustodyCheck {
             required: &required,
@@ -141,7 +142,8 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
             public
         );
         // W4: recover the spend ceiling so a restart cannot silently reset it.
-        demo_swap::restore_budget(&cfg, &demo);
+        demo_swap::restore_budget(&cfg, &demo)
+            .context("demo swaps refused to start (W4 budget recovery)")?;
     }
     let state = AppState {
         cfg: cfg.clone(),
@@ -152,6 +154,7 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         demo_floats: Arc::new(FloatCache::new()),
         demo_wallets: DemoWallets::from_env(),
         demo_fees: DemoFees::from_env(),
+        client_ip_policy,
         demo_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
@@ -278,7 +281,7 @@ async fn u4_middleware(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0);
-    let resolved_ip = client_ip(req.headers(), peer);
+    let resolved_ip = client_ip(req.headers(), peer, state.client_ip_policy);
     req.extensions_mut().insert(ClientIp(resolved_ip));
     let origin = req
         .headers()
@@ -721,11 +724,10 @@ async fn v1_rgb_plan(State(s): State<AppState>, Path(id): Path<String>) -> Respo
 
 async fn v1_rgb_verify(
     State(s): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
     body: bytes::Bytes,
 ) -> Response {
-    let peer = addr.ip().to_string();
-    if !s.verify_limiter.check(&peer) {
+    if !s.verify_limiter.check(&ip) {
         return err_code(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -776,40 +778,110 @@ async fn v1_rgb_transfer(State(s): State<AppState>, body: bytes::Bytes) -> Respo
     }
 }
 
-/// Resolve the client IP used for per-IP demo quotas.
-///
-/// Defaults to the socket peer, which cannot be spoofed. Behind exactly one
-/// trusted proxy (Cloud Run / GCLB) set `LABD_TRUST_XFF=1`: that proxy appends
-/// the real client IP to `X-Forwarded-For`, so the **rightmost** entry is the
-/// trustworthy one. Never take the leftmost — it is attacker-supplied and would
-/// let one visitor mint unlimited quota identities.
-///
-/// When the peer address is unavailable, all such requests share the single
-/// `"unknown"` quota bucket — deliberately stricter, never more permissive.
-fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    let trust_xff = std::env::var("LABD_TRUST_XFF")
-        .map(|v| {
-            let t = v.trim().to_ascii_lowercase();
-            t == "1" || t == "true" || t == "yes" || t == "on"
-        })
-        .unwrap_or(false);
-    if trust_xff {
-        if let Some(xff) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-        {
-            if let Some(last) = xff
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .next_back()
-            {
-                return last.to_string();
-            }
+const MAX_XFF_ENTRIES: usize = 16;
+const MAX_TRUSTED_PROXY_HOPS: usize = 8;
+
+/// Client-IP trust is topology, not a Boolean. `trusted_proxy_hops` is the
+/// exact number of proxy-created XFF entries to discard from the right.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientIpPolicy {
+    trusted_proxy_hops: usize,
+}
+
+impl ClientIpPolicy {
+    fn from_env() -> Result<Self> {
+        Self::from_values(
+            std::env::var("LABD_XFF_TRUSTED_HOPS").ok().as_deref(),
+            std::env::var("LABD_TRUST_XFF").ok().as_deref(),
+        )
+    }
+
+    fn from_values(hops: Option<&str>, legacy: Option<&str>) -> Result<Self> {
+        let legacy_enabled = legacy
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        anyhow::ensure!(
+            !legacy_enabled,
+            "LABD_TRUST_XFF is unsafe and no longer supported; set the exact trusted suffix length with LABD_XFF_TRUSTED_HOPS"
+        );
+        let trusted_proxy_hops = match hops.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => v
+                .parse::<usize>()
+                .with_context(|| format!("LABD_XFF_TRUSTED_HOPS must be an integer, got {v:?}"))?,
+            None => 0,
+        };
+        anyhow::ensure!(
+            trusted_proxy_hops <= MAX_TRUSTED_PROXY_HOPS,
+            "LABD_XFF_TRUSTED_HOPS must be between 0 and {MAX_TRUSTED_PROXY_HOPS}"
+        );
+        Ok(Self { trusted_proxy_hops })
+    }
+
+    fn description(self) -> String {
+        if self.trusted_proxy_hops == 0 {
+            "socket peer (X-Forwarded-For ignored)".into()
+        } else {
+            format!(
+                "X-Forwarded-For with {} trusted right-edge hop(s)",
+                self.trusted_proxy_hops
+            )
         }
     }
-    peer.map(|p| p.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Resolve the client IP used for per-IP demo quotas.
+///
+/// Without an explicit topology, XFF is ignored and the unspoofable socket peer
+/// is used. With `N` trusted proxy hops, discard exactly `N` validated IPs from
+/// the right and select the next validated IP. For Google External Application
+/// Load Balancers, the suffix is normally `client-ip, load-balancer-ip`, so
+/// `N=1` selects the client instead of collapsing quotas onto the balancer.
+///
+/// Multiple header fields, invalid/non-IP entries, oversized chains, or too few
+/// entries fall back to the socket peer. If peer information is unavailable,
+/// all such requests share `"unknown"`, which is stricter than minting identities.
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, policy: ClientIpPolicy) -> String {
+    let fallback = || {
+        peer.map(|p| p.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    if policy.trusted_proxy_hops == 0 {
+        return fallback();
+    }
+
+    let mut values = headers.get_all("x-forwarded-for").iter();
+    let Some(value) = values.next() else {
+        return fallback();
+    };
+    if values.next().is_some() {
+        return fallback();
+    }
+    let Ok(value) = value.to_str() else {
+        return fallback();
+    };
+    let raw: Vec<&str> = value.split(',').map(str::trim).collect();
+    if raw.is_empty() || raw.len() > MAX_XFF_ENTRIES || raw.iter().any(|entry| entry.is_empty()) {
+        return fallback();
+    }
+    let Some(index) = raw.len().checked_sub(policy.trusted_proxy_hops + 1) else {
+        return fallback();
+    };
+    // Values left of `index` are outside the trusted suffix and Google warns
+    // they may be attacker supplied, including non-IP text. Validate only the
+    // selected client and every trusted right-edge proxy entry.
+    let trusted: Option<Vec<IpAddr>> = raw[index..]
+        .iter()
+        .map(|entry| entry.parse().ok())
+        .collect();
+    let Some(trusted) = trusted else {
+        return fallback();
+    };
+    trusted[0].to_string()
 }
 
 fn demo_denial_response(d: &lab_core::DemoDenial) -> Response {
@@ -889,6 +961,27 @@ async fn v1_demo_swap(
         return demo_denial_response(&d);
     }
 
+    // The worst-case fee reservation must reach persistent storage before any
+    // session is created or transaction can be broadcast. If storage is
+    // unavailable, release only the unspent in-memory reservation and refuse.
+    let persist_cfg = s.cfg.clone();
+    let persist_gov = s.demo.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        demo_swap::persist_budget(&persist_cfg, &persist_gov)
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            s.demo.abort();
+            return err_json(StatusCode::SERVICE_UNAVAILABLE, e);
+        }
+        Err(e) => {
+            s.demo.abort();
+            return err_json(StatusCode::SERVICE_UNAVAILABLE, e);
+        }
+    }
+
     // Admitted — create the session with server-fixed parameters.
     let seq = s
         .demo_seq
@@ -903,10 +996,16 @@ async fn v1_demo_swap(
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
             s.demo.abort();
+            if let Err(save_err) = demo_swap::persist_budget(&s.cfg, &s.demo) {
+                eprintln!("demo: failed to persist unspent admission abort: {save_err:#}");
+            }
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
         }
         Err(e) => {
             s.demo.abort();
+            if let Err(save_err) = demo_swap::persist_budget(&s.cfg, &s.demo) {
+                eprintln!("demo: failed to persist unspent admission abort: {save_err:#}");
+            }
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
         }
     };
@@ -920,16 +1019,19 @@ async fn v1_demo_swap(
         let fees = s.demo_fees;
         tokio::task::spawn_blocking(move || {
             match demo_swap::drive_demo_swap_blocking(&cfg, &id, leg, fees) {
-                Ok(fee) => gov.finish(fee),
+                Ok(fee) => gov.finish_with_liability(fee, fees.btc_sweep_fee_sats),
                 Err(e) => {
                     eprintln!("demo: swap {id} failed: {e}");
-                    // Counters are intentionally retained (anti retry-spam);
-                    // only the in-flight slot and fee reservation are released.
-                    gov.abort();
+                    // Execution may already have broadcast a funding tx. The
+                    // exact fee is unknown, so charge the full reservation.
+                    gov.fail_closed();
                 }
             }
-            // W4: settle to disk immediately, so spend survives a restart.
-            demo_swap::persist_budget(&cfg, &gov);
+            // The prior durable state still holds the full reservation, so a
+            // failed settlement write remains conservative across restart.
+            if let Err(e) = demo_swap::persist_budget(&cfg, &gov) {
+                eprintln!("demo: failed to persist budget settlement: {e:#}");
+            }
         });
     }
 
@@ -1000,9 +1102,11 @@ mod tests {
             demo_fees: DemoFees {
                 btc_fee_sats: 800,
                 btc_claim_fee_sats: 500,
+                btc_sweep_fee_sats: 500,
                 lq_fee_sats: 300,
                 lq_sweep_fee_sats: 400,
             },
+            client_ip_policy: ClientIpPolicy::default(),
             demo_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -1230,24 +1334,143 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_peer_unless_xff_trusted() {
+    fn client_ip_uses_exact_trusted_suffix_and_validates_the_chain() {
         let peer: SocketAddr = "203.0.113.9:1234".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert(
             "x-forwarded-for",
-            HeaderValue::from_static("1.1.1.1, 2.2.2.2"),
+            HeaderValue::from_static("198.51.100.66, 192.0.2.10, 192.0.2.20"),
         );
-        std::env::remove_var("LABD_TRUST_XFF");
-        assert_eq!(client_ip(&h, Some(peer)), "203.0.113.9", "peer IP by default");
+        assert_eq!(
+            client_ip(&h, Some(peer), ClientIpPolicy::default()),
+            "203.0.113.9",
+            "XFF is ignored without an explicit topology"
+        );
+        assert_eq!(
+            client_ip(
+                &h,
+                Some(peer),
+                ClientIpPolicy {
+                    trusted_proxy_hops: 1,
+                },
+            ),
+            "192.0.2.10",
+            "Google-style client,load-balancer suffix selects next-to-last"
+        );
+        assert_eq!(
+            client_ip(
+                &h,
+                Some(peer),
+                ClientIpPolicy {
+                    trusted_proxy_hops: 2,
+                },
+            ),
+            "198.51.100.66"
+        );
 
-        std::env::set_var("LABD_TRUST_XFF", "1");
-        // Rightmost = appended by the trusted proxy; leftmost is spoofable.
-        assert_eq!(client_ip(&h, Some(peer)), "2.2.2.2");
-        std::env::remove_var("LABD_TRUST_XFF");
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("attacker-supplied, 192.0.2.10, 192.0.2.20"),
+        );
+        assert_eq!(
+            client_ip(
+                &h,
+                Some(peer),
+                ClientIpPolicy {
+                    trusted_proxy_hops: 1,
+                },
+            ),
+            "192.0.2.10",
+            "untrusted prefix content must not control resolution"
+        );
 
-        // No peer info: one shared, stricter bucket rather than a 500.
-        std::env::remove_var("LABD_TRUST_XFF");
-        assert_eq!(client_ip(&HeaderMap::new(), None), "unknown");
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("2001:db8::10, 2001:db8::20"),
+        );
+        assert_eq!(
+            client_ip(
+                &h,
+                Some(peer),
+                ClientIpPolicy {
+                    trusted_proxy_hops: 1,
+                },
+            ),
+            "2001:db8::10"
+        );
+
+        for bad in ["not-an-ip, 192.0.2.20", "192.0.2.10,", "192.0.2.20"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_str(bad).unwrap());
+            assert_eq!(
+                client_ip(
+                    &headers,
+                    Some(peer),
+                    ClientIpPolicy {
+                        trusted_proxy_hops: 1,
+                    },
+                ),
+                "203.0.113.9",
+                "bad chain must collapse to the unspoofable peer bucket"
+            );
+        }
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.0.2.10, 192.0.2.20"),
+        );
+        duplicate.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.0.2.30, 192.0.2.40"),
+        );
+        assert_eq!(
+            client_ip(
+                &duplicate,
+                Some(peer),
+                ClientIpPolicy {
+                    trusted_proxy_hops: 1,
+                },
+            ),
+            "203.0.113.9"
+        );
+
+        let oversized = (0..=MAX_XFF_ENTRIES)
+            .map(|i| format!("192.0.2.{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut oversized_headers = HeaderMap::new();
+        oversized_headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_str(&oversized).unwrap(),
+        );
+        assert_eq!(
+            client_ip(
+                &oversized_headers,
+                Some(peer),
+                ClientIpPolicy {
+                    trusted_proxy_hops: 1,
+                },
+            ),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            client_ip(&HeaderMap::new(), None, ClientIpPolicy::default()),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn client_ip_policy_rejects_legacy_boolean_and_bad_hop_counts() {
+        assert_eq!(
+            ClientIpPolicy::from_values(Some("1"), None).unwrap(),
+            ClientIpPolicy {
+                trusted_proxy_hops: 1
+            }
+        );
+        assert!(ClientIpPolicy::from_values(None, Some("1")).is_err());
+        assert!(ClientIpPolicy::from_values(Some("nope"), None).is_err());
+        assert!(ClientIpPolicy::from_values(Some("9"), None).is_err());
     }
 
     #[tokio::test]
