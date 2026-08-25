@@ -289,11 +289,42 @@ Sweeping would have destroyed value, so it correctly declined.
 - The **W5 refund watcher**, CSV refund path, and recycle-after-refund.
 - Demo-exit sweep on **both** chains, and its dust guard.
 - Preimage redaction on the public view, mid-flight.
+- Turnstile success on the public hostname with the exact
+  `rgbmvp_demo_swap` action (2026-08-24 acceptance attempt; §11). The token
+  reached admission and was consumed once.
 
 **Still unproven**
-- **Turnstile against a real request.** Every run used
-  `LABD_DEMO_TURNSTILE_REQUIRED=0` (no Cloudflare secret available locally). The
-  fail-closed path is unit-tested; the pass path is not exercised live. This is
-  the last functional gap before public exposure.
 - Behaviour under a slow-block stretch, and a restart *during* a live swap.
 - Confidential Liquid outputs are invisible to the sweep (explicit L-BTC only).
+
+---
+
+## 11. Public Turnstile acceptance attempt and rollback
+
+**Date:** 2026-08-24 · **Session:** `demo-1787618034-0`
+**Result:** ❌ pre-execution failure; no transaction broadcast; T1 fully frozen.
+
+The visitor completed the real Cloudflare Turnstile widget on
+`swaplab.ffwd-ai.com`. The exact-action/hostname server check passed, admission
+persisted generation `1787618034511863` with one in-flight swap and the full
+**1,800-sat reservation**, and session initialization began. The request then
+returned HTTP 500 before the background driver started. The created session
+remained at phase `created` with both funding txids null. The application used
+its proven-pre-execution abort path and persisted generation
+`1787618035231721` with the slot and reservation released while retaining the
+day/IP quota charge.
+
+Live and source evidence isolated the failure to private session persistence:
+the JSON object was written, while the next Unix operation attempted to change
+its mode to `0600`. The Cloud Run volume had been mounted with Cloud Storage
+FUSE's default `0666` file mode. Cloud Storage FUSE controls effective modes at
+mount time rather than with normal per-object POSIX chmod behavior.
+
+Immediate containment first set `LABD_DEMO_SWAPS=0`, then applied the repository
+full rollback profile `deploy/cloudrun-demo-freeze.yaml`. Revision
+`rgbmvp-demo-00013-5hl` serves 100% of traffic with the unprivileged
+`rgbmvp-public-run` identity, no volumes, no secret mounts, and no demo mutation
+flags. The remediation mounts the isolated T1 volume with
+`file-mode=600,dir-mode=700` and verifies the effective session-file mode before
+execution. T1 remains frozen until that change passes CI and a fresh operator
+acceptance attempt.
