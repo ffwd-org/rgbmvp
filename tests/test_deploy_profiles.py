@@ -36,6 +36,14 @@ def test_t1_demo_pins_turnstile_action_and_hostname_context() -> None:
     assert 'pub const TURNSTILE_ACTION: &str = "rgbmvp_demo_swap";' in server
 
 
+def test_rgb_demo_uses_turnstile_explicit_onload_without_ready() -> None:
+    index = (ROOT / "web/index.html").read_text(encoding="utf-8")
+    assert "api.js?onload=onRgbDemoTurnstileLoad&render=explicit" in index
+    assert "window.onRgbDemoTurnstileLoad = mountPublicRgbDemoBotCheck" in index
+    assert "turnstile.ready(" not in index
+    assert "action: rgbDemoQuota.turnstile_action || 'rgbmvp_rgb_lab'" in index
+
+
 def test_t1_demo_mounts_private_session_state() -> None:
     demo = (ROOT / "deploy/cloudrun-demo.yaml").read_text(encoding="utf-8")
     image = (ROOT / "Dockerfile.public").read_text(encoding="utf-8")
