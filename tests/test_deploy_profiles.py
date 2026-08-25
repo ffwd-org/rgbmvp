@@ -36,6 +36,11 @@ def test_t1_demo_pins_turnstile_action_and_hostname_context() -> None:
     assert 'pub const TURNSTILE_ACTION: &str = "rgbmvp_demo_swap";' in server
 
 
+def test_t1_demo_mounts_private_session_state() -> None:
+    demo = (ROOT / "deploy/cloudrun-demo.yaml").read_text(encoding="utf-8")
+    assert "mountOptions: file-mode=600,dir-mode=700" in demo
+
+
 def test_t1_freeze_profile_removes_mutation_and_custody() -> None:
     freeze = (ROOT / "deploy/cloudrun-demo-freeze.yaml").read_text(encoding="utf-8")
     forbidden = (

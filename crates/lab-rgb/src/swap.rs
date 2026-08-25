@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::htlc::{self, HtlcAddressInfo};
@@ -107,14 +107,48 @@ impl SwapStore {
     pub fn save(&self, s: &SwapSession) -> Result<PathBuf> {
         self.ensure()?;
         let p = self.path(&s.id);
-        fs::write(&p, serde_json::to_vec_pretty(s)?)?;
+        let bytes = serde_json::to_vec_pretty(s)?;
         #[cfg(unix)]
         {
+            use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&p)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&p, perms)?;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // Set the private mode at creation time and verify it before any
+            // preimage bytes are written. Cloud Storage FUSE applies one mode
+            // at mount time and does not provide normal per-object chmod
+            // semantics, so an insecure mount must fail before persistence.
+            let existed = p.exists();
+            if existed {
+                let current = fs::metadata(&p)?.permissions().mode() & 0o777;
+                ensure!(
+                    current == 0o600,
+                    "swap session {} has insecure mode {current:04o}; expected 0600",
+                    p.display()
+                );
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&p)?;
+            let effective = file.metadata()?.permissions().mode() & 0o777;
+            if effective != 0o600 {
+                drop(file);
+                if !existed {
+                    let _ = fs::remove_file(&p);
+                }
+                bail!(
+                    "swap session {} has insecure mode {effective:04o}; expected 0600",
+                    p.display()
+                );
+            }
+            file.write_all(&bytes)?;
+            file.sync_all()?;
         }
+        #[cfg(not(unix))]
+        fs::write(&p, bytes)?;
         Ok(p)
     }
 
@@ -517,9 +551,53 @@ mod tests {
         )
         .unwrap();
         store.save(&s).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = store.path("id1");
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Rewriting a file that is already 0600 exercises the GCSFUSE-safe
+        // path that never relies on per-object chmod.
+        store.save(&s).unwrap();
         let loaded = store.load("id1").unwrap();
         assert_eq!(loaded.preimage_hex, s.preimage_hex);
         assert_eq!(loaded.hash_hex, s.hash_hex);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_refuses_insecure_existing_session_before_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rgbmvp-swap-insecure-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SwapStore::new(&dir);
+        store.ensure().unwrap();
+        let path = store.path("id1");
+        std::fs::write(&path, b"sentinel").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let s = init_swap(
+            &htlc::test_keyring(),
+            "id1",
+            6,
+            "a",
+            "b",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err = store.save(&s).unwrap_err();
+        assert!(err.to_string().contains("insecure mode 0644"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

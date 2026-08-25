@@ -67,6 +67,14 @@ A remaining pending record is therefore
 the authoritative recovery point. A malformed or unreadable pending or primary
 record blocks startup; it never falls back to zero.
 
+The same volume stores swap sessions, which contain the private preimage needed
+to settle or refund a swap. `deploy/cloudrun-demo.yaml` therefore mounts Cloud
+Storage FUSE with `file-mode=600,dir-mode=700`. Session persistence verifies an
+effective mode of exactly `0600` and fails before execution if the mount is
+insecure. It sets the creation mode and verifies it before writing any preimage
+bytes; it never relies on `chmod`, because Cloud Storage FUSE controls modes
+globally rather than per object.
+
 At startup, a persisted in-flight reservation is converted to `committed` and
 the normalized state is durably saved before the service accepts traffic. Old
 snapshots remain readable through Serde defaults; any old `fee_reserved_sats`
