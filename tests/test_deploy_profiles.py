@@ -38,7 +38,11 @@ def test_t1_demo_pins_turnstile_action_and_hostname_context() -> None:
 
 def test_t1_demo_mounts_private_session_state() -> None:
     demo = (ROOT / "deploy/cloudrun-demo.yaml").read_text(encoding="utf-8")
-    assert "mountOptions: file-mode=600,dir-mode=700" in demo
+    image = (ROOT / "Dockerfile.public").read_text(encoding="utf-8")
+    assert "USER nobody" in image
+    assert (
+        "mountOptions: uid=65534,gid=65534,file-mode=600,dir-mode=700" in demo
+    )
 
 
 def test_t1_freeze_profile_removes_mutation_and_custody() -> None:

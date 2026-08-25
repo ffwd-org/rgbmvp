@@ -325,6 +325,10 @@ full rollback profile `deploy/cloudrun-demo-freeze.yaml`. Revision
 `rgbmvp-demo-00013-5hl` serves 100% of traffic with the unprivileged
 `rgbmvp-public-run` identity, no volumes, no secret mounts, and no demo mutation
 flags. The remediation mounts the isolated T1 volume with
-`file-mode=600,dir-mode=700` and verifies the effective session-file mode before
-execution. T1 remains frozen until that change passes CI and a fresh operator
-acceptance attempt.
+`uid=65534,gid=65534,file-mode=600,dir-mode=700` and verifies the effective
+session-file mode before execution. The explicit owner matches the Debian
+`nobody` runtime user. A first disabled-admission candidate confirmed the
+`0600/0700` modes in GCSFUSE logs but failed closed creating `/data/wallets`
+because the mount still had its default `1000:1000` owner; traffic never left
+the rollback revision. T1 remains frozen until the corrected owner passes CI
+and a fresh operator acceptance attempt.
