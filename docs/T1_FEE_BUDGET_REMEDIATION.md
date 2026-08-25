@@ -44,6 +44,11 @@ those configured fees. The 28,000-sat ceiling therefore permits at most
 **15 admissions**, leaving 1,000 sats of accounting headroom. Batching may make
 the actual sweep cheaper, but the ceiling does not depend on that saving.
 
+Startup also requires the fixed leg to exceed the claim/refund fee, exit-sweep
+fee, and 294-sat P2WPKH dust threshold. The default 1,300-sat leg leaves a
+300-sat return output, so one completed or refunded BTC leg is recyclable
+without waiting for another exit to accumulate at the same derived address.
+
 Settlement records actual and committed fees in full, without clamping them to
 the reservation. An unexpected overrun can therefore make accounted expenditure
 exceed the ceiling; that accurate state reports zero remaining swaps and blocks

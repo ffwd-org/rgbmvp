@@ -112,6 +112,23 @@ impl DemoFees {
         );
         Ok(())
     }
+
+    /// Refuse a BTC leg whose individual claim/refund exit cannot be swept
+    /// with the configured fee while retaining a standard P2WPKH output.
+    pub fn validate_recyclable_btc_exit(&self, leg_sats: u64) -> Result<()> {
+        let required = u128::from(self.btc_claim_fee_sats)
+            + u128::from(self.btc_sweep_fee_sats)
+            + u128::from(lab_btc::DEMO_EXIT_DUST_THRESHOLD_SATS);
+        anyhow::ensure!(
+            u128::from(leg_sats) > required,
+            "LABD_DEMO_LEG_SATS ({leg_sats}) must exceed {required} sats \
+             ({} claim/refund fee + {} sweep fee + {} dust) so one BTC exit is recyclable",
+            self.btc_claim_fee_sats,
+            self.btc_sweep_fee_sats,
+            lab_btc::DEMO_EXIT_DUST_THRESHOLD_SATS
+        );
+        Ok(())
+    }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -1010,6 +1027,15 @@ mod tests {
     }
 
     #[test]
+    fn btc_leg_must_be_individually_recyclable() {
+        let fees = test_fees();
+        assert!(fees.validate_recyclable_btc_exit(1_300).is_ok());
+        assert!(fees.validate_recyclable_btc_exit(1_295).is_ok());
+        assert!(fees.validate_recyclable_btc_exit(1_294).is_err());
+        assert!(fees.validate_recyclable_btc_exit(1_000).is_err());
+    }
+
+    #[test]
     fn demo_swap_ids_are_path_safe() {
         for seq in [0u64, 1, 42, 99_999] {
             let id = new_demo_swap_id(seq);
@@ -1552,7 +1578,7 @@ mod tests {
         );
         assert_eq!(v["enabled"], json!(true));
         assert_eq!(v["rgb_wrap"], json!(false));
-        assert_eq!(v["leg_sats"], json!(1_000));
+        assert_eq!(v["leg_sats"], json!(1_300));
         let expected =
             lab_core::demo::DEFAULT_FEE_BUDGET_SATS / lab_core::demo::DEFAULT_MAX_FEE_PER_SWAP_SATS;
         assert_eq!(v["budget"]["swaps_remaining_est"], json!(expected));
