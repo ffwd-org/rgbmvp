@@ -29,7 +29,7 @@ pub const DEMO_MAX_LEG_SATS: u64 = 5_000;
 pub const DEMO_RGB_WRAP: bool = false;
 
 // Defaults — see the quota table in docs/TESTNET_PUBLIC_SWAPS.md §1a.
-pub const DEFAULT_LEG_SATS: u64 = 1_000;
+pub const DEFAULT_LEG_SATS: u64 = 1_300;
 pub const DEFAULT_MAX_FEE_PER_SWAP_SATS: u64 = 1_800;
 pub const DEFAULT_FEE_BUDGET_SATS: u64 = 28_000;
 pub const DEFAULT_DAILY_CAP: u32 = 6;

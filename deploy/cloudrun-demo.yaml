@@ -218,7 +218,9 @@ spec:
               value: "1"
             # --- Budget (docs/TESTNET_PUBLIC_SWAPS.md §1a) ---
             - name: LABD_DEMO_LEG_SATS
-              value: "1000"
+              # Minimum round value whose 500-sat claim/refund exit can pay the
+              # 500-sat sweep fee and still return a standard 300-sat output.
+              value: "1300"
             # Fees: repo-proven values, measured live at 5.25 / 3.63 sat/vB
             # (docs/T1_FIRST_SWAP.md). An earlier draft used 200/100 from vbyte
             # arithmetic (~1.4 sat/vB) which risks sitting unconfirmed.

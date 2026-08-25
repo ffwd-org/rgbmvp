@@ -657,6 +657,12 @@ pub fn find_htlc_utxo(btc: &BtcConfig, address: &str, min_sats: u64) -> Result<B
 /// Labels every BTC-side HTLC exit pays out to.
 pub const BTC_DEMO_EXIT_LABELS: [&str; 2] = ["bob-claimer", "alice-refund"];
 
+/// Minimum standard P2WPKH output retained after a demo-exit sweep.
+///
+/// Kept public so T1 startup can reject a leg/fee combination that would
+/// strand the output from a single swap until another exit accumulates.
+pub const DEMO_EXIT_DUST_THRESHOLD_SATS: u64 = 294;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepResult {
     pub label: String,
@@ -729,7 +735,7 @@ pub fn sweep_demo_exit(
         return Ok(result);
     }
     // Dust guard: sweeping for less than the fee would destroy value.
-    if total <= fee_sats + 294 {
+    if total <= fee_sats + DEMO_EXIT_DUST_THRESHOLD_SATS {
         result.skipped_reason = Some(format!(
             "balance {total} does not cover fee {fee_sats} plus dust threshold"
         ));

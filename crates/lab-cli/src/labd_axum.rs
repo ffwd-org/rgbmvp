@@ -114,6 +114,8 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         let fees = DemoFees::from_env();
         fees.validate_reservation(p.max_fee_per_swap_sats)
             .context("T1 refused: budget reservation would be unsound")?;
+        fees.validate_recyclable_btc_exit(p.leg_sats)
+            .context("T1 refused: a single BTC exit would not be recyclable")?;
         // W3: refuse to sign with image-baked or over-permissive key material.
         // Public = anything not bound to loopback, or explicitly read-only mode.
         let wallets = DemoWallets::from_env();

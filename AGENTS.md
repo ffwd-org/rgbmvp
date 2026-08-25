@@ -74,6 +74,9 @@ Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
   failure may release a reservation. The maximum must include the BTC funding,
   claim/refund, and exit-sweep fees. Startup refuses under-reservation, and
   runtime settlement records actual fees without clamping them to the reserve.
+- The fixed BTC leg must be individually recyclable: after the claim/refund and
+  exit-sweep fees, its return output must remain above the P2WPKH dust threshold.
+  Startup refuses a leg/fee combination that would strand a single exit.
 - Custody (`lab_core::custody`) resolves keys from `RGBMVP_SECRET_DIR`
   (colon-separated) before local wallet dirs, and labd refuses to start on a
   public bind without it, or with a group/world-readable key.

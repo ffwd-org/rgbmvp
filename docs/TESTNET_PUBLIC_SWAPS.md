@@ -119,7 +119,10 @@ retain the old secret version until zero balances are independently verified.
 **Cost-minimization defaults:**
 - **Value-only HTLC path (`rgb_wrap=false`)** — avoids tapret commitment dust
   (~330 sats/leg) and extra RGB transactions. RGB-wrapped stays operator-only.
-- **Minimal leg size:** 1,000 sats/leg, server-fixed.
+- **Minimal individually recyclable leg size:** 1,300 sats/leg, server-fixed.
+  With the proven 500-sat claim/refund and 500-sat exit-sweep fees, this leaves
+  a 300-sat P2WPKH return output above the 294-sat dust threshold. Startup
+  refuses any configured leg that would strand a single exit.
 - **Fees are the repo's proven values** (fund 800 / claim 500 / LQ 300), not the
   ~200-sat vbyte estimate an earlier draft used. Now **measured live** at 5.25
   and 3.63 sat/vB — see [T1_FIRST_SWAP.md](./T1_FIRST_SWAP.md). There is room to
@@ -132,7 +135,7 @@ retain the old secret version until zero balances are independently verified.
 
 | Control | Value | Rationale |
 |---|---|---|
-| Leg size (BTC & LQ) | 1,000 sats | Just above dust; minimal footprint |
+| Leg size (BTC & LQ) | 1,300 sats | Smallest round value that makes one BTC exit independently recyclable |
 | BTC budget/admission | 1,800 sats | 800 fund + 500 claim/refund + 500 sweep |
 | **BTC fee budget** | **28,000 sats** | of btc-alice's 33.6k, leaves buffer |
 | **Total admissions** | **15** | floor(28,000 / 1,800), with 1,000 sats headroom |
@@ -223,7 +226,7 @@ RGB float rebalance path.
 ### W2 — Abuse controls (the core of “bounded”)
 All starting values are in the **§1a quota table** (budget-grounded on the
 measured BTC scarcity). Implement each as config so they tune without a redeploy.
-- **Amount cap:** demo leg size server-fixed at ~1,000 sats; reject any request
+- **Amount cap:** demo leg size server-fixed at 1,300 sats; reject any request
   or config that raises it in demo mode. Value-only path by default.
 - **Faucet float floor:** pause new swaps when btc-alice < 5,000 sats (auto-refill
   from btc-funder if available) or bob (LQ) < 20,000; alert on low float.
