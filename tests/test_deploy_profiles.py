@@ -45,6 +45,21 @@ def test_t1_demo_mounts_private_session_state() -> None:
     )
 
 
+def test_demo_wallet_watch_bundle_is_pinned_and_not_a_signing_source() -> None:
+    demo = (ROOT / "deploy/cloudrun-demo.yaml").read_text(encoding="utf-8")
+    assert "secretName: rgbmvp-demo-liquid-watch-bundle" in demo
+    assert '- key: "1"\n                path: liquid-watch.json' in demo
+    assert "mountPath: /secrets-watch" in demo
+    assert (
+        "- name: RGBMVP_LIQUID_WATCH_BUNDLE\n"
+        "              value: /secrets-watch/liquid-watch.json"
+    ) in demo
+    secret_dir_line = next(
+        line for line in demo.splitlines() if "/secrets:/secrets-lq:" in line
+    )
+    assert "/secrets-watch" not in secret_dir_line
+
+
 def test_t1_freeze_profile_removes_mutation_and_custody() -> None:
     freeze = (ROOT / "deploy/cloudrun-demo-freeze.yaml").read_text(encoding="utf-8")
     forbidden = (
@@ -55,6 +70,8 @@ def test_t1_freeze_profile_removes_mutation_and_custody() -> None:
         "- name: LABD_DEMO_TURNSTILE_HOSTNAMES",
         "- name: LABD_TRUST_XFF",
         "- name: LABD_DEMO_SWEEP_INTERVAL_SECS",
+        "- name: RGBMVP_LIQUID_WATCH_BUNDLE",
+        "rgbmvp-demo-liquid-watch-bundle",
         "secretKeyRef:",
         "volumeMounts:",
         "\n      volumes:",

@@ -22,7 +22,8 @@
 #
 # Prerequisites (see deploy/README.md "T1 demo swap deployment"):
 #   - Secret Manager: rgbmvp-demo-btc-alice-wif, rgbmvp-demo-bob-mnemonic,
-#     rgbmvp-demo-bob-descriptor, rgbmvp-demo-exit-seed
+#     rgbmvp-demo-bob-descriptor, rgbmvp-demo-exit-seed,
+#     rgbmvp-demo-liquid-watch-bundle (watch-only; no spending keys)
 #   - GCS bucket for the persistent volume (versioning ON)
 #   - Turnstile secret: rgbmvp-demo-turnstile-secret
 #   - Runtime SA rgbmvp-demo-run@PROJECT.iam.gserviceaccount.com
@@ -86,6 +87,16 @@ spec:
               - key: latest
                 path: demo-exits/seed
                 mode: 0400
+        # Public board only: xpub derivation + SLIP77 blinding material. This
+        # bundle can reveal the five predefined testnet wallet balances but
+        # cannot sign. Pin the reviewed version for deterministic rollback.
+        - name: liquid-watch-bundle
+          secret:
+            secretName: rgbmvp-demo-liquid-watch-bundle
+            items:
+              - key: "1"
+                path: liquid-watch.json
+                mode: 0400
         # W4 — persistent state for write-ahead reservations and sessions.
         # Corrupt or unavailable budget state makes T1 refuse startup.
         - name: demo-data
@@ -116,6 +127,9 @@ spec:
             - name: demo-exit-seed
               mountPath: /secrets-exits
               readOnly: true
+            - name: liquid-watch-bundle
+              mountPath: /secrets-watch
+              readOnly: true
             - name: demo-data
               mountPath: /data
           env:
@@ -141,6 +155,14 @@ spec:
             # volume/mountPath, so one directory cannot hold both keys. ---
             - name: RGBMVP_SECRET_DIR
               value: /secrets:/secrets-lq:/secrets-lq-descriptor:/secrets-exits
+            # Display-only watch bundle. Deliberately outside
+            # RGBMVP_SECRET_DIR so no signing path can resolve it.
+            - name: RGBMVP_LIQUID_WATCH_BUNDLE
+              value: /secrets-watch/liquid-watch.json
+            - name: LABD_WALLET_BALANCE_TTL_SECS
+              value: "120"
+            - name: LABD_WALLET_BALANCE_MAX_STALE_SECS
+              value: "900"
             # --- T1: the bounded public trigger ---
             - name: LABD_DEMO_SWAPS
               value: "1"

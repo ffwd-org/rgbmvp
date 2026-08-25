@@ -10,6 +10,8 @@ use lab_rgb::{
     issue_nia, plan_transfer, verify_against_witness, IssueRequest, DEMO_INTERNAL_XONLY_HEX,
 };
 
+use crate::wallet_watch::{WalletBalanceBoard, WalletBalanceView};
+
 /// Public swap JSON: never expose preimage (shared `lab_api::public_swap_view`).
 pub(crate) fn public_swap_view(s: &lab_rgb::swap::SwapSession, cfg: &Config) -> serde_json::Value {
     let btc_ex = std::env::var("BTC_TESTNET_EXPLORER")
@@ -743,17 +745,30 @@ pub(crate) fn list_swap_ids(data_dir: &std::path::Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+fn merge_balance_fields(wallet: &mut serde_json::Value, balance: WalletBalanceView) {
+    let Some(target) = wallet.as_object_mut() else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(balance) else {
+        return;
+    };
+    target.extend(fields);
+}
+
 /// Read-only demo board: Liquid + BTC lab wallets and balances.
-pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
+pub(crate) fn demo_wallets(
+    cfg: &Config,
+    balance_board: &WalletBalanceBoard,
+) -> Result<serde_json::Value> {
     let btc = lab_btc::BtcConfig::from_env();
     let mut wallets = Vec::new();
+    let balance_snapshot = balance_board.snapshot_blocking(cfg);
 
     for name in ["alice", "bob", "carol", "maker", "lab0"] {
         if !cfg.wallet_path(name).join("descriptor").exists() {
             continue;
         }
         let addr = lab_chain::wallet_address(cfg, name, Some(0)).ok();
-        let bal = lab_chain::wallet_balance(cfg, name).ok();
         let role = std::fs::read_to_string(cfg.wallet_path(name).join("meta.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -761,20 +776,20 @@ pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
                 v.get("role")
                     .and_then(|r| r.as_str().map(|x| x.to_string()))
             });
-        wallets.push(serde_json::json!({
+        let mut wallet = serde_json::json!({
             "name": name,
             "chain": "liquid-testnet",
             "role": role,
             "address": addr.as_ref().map(|a| &a.address),
-            "lbtc_sats": bal.as_ref().map(|b| b.lbtc_sats),
-            "balances_sats": bal.as_ref().map(|b| &b.balances_sats),
             "explorer": addr.as_ref().map(|a| format!(
                 "{}/address/{}",
                 cfg.explorer_base.trim_end_matches('/'),
                 a.address
             )),
             "error": if addr.is_none() { Some("load failed") } else { None::<&str> },
-        }));
+        });
+        merge_balance_fields(&mut wallet, balance_snapshot.wallet(name));
+        wallets.push(wallet);
     }
 
     if lab_btc::wallet_exists(cfg, "btc-alice") {
@@ -788,6 +803,9 @@ pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
             "btc_sats": bal.as_ref().map(|b| b.balance_sats),
             "utxo_count": bal.as_ref().map(|b| b.utxo_count),
             "explorer": info.as_ref().map(|i| &i.explorer_url),
+            "balance_source": "blockstream-esplora",
+            "balance_scope": "address-utxos",
+            "balance_status": if bal.is_some() { "live" } else { "unavailable" },
         }));
     }
 
@@ -816,6 +834,9 @@ pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
                         address
                     ),
                     "source": "public-address-file",
+                    "balance_source": "blockstream-esplora",
+                    "balance_scope": "address-utxos",
+                    "balance_status": if bal.is_some() { "live" } else { "unavailable" },
                 }));
             }
         }
@@ -852,27 +873,32 @@ pub(crate) fn demo_wallets(cfg: &Config) -> Result<serde_json::Value> {
                     continue;
                 }
                 let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or(name);
-                wallets.push(serde_json::json!({
+                let mut wallet = serde_json::json!({
                     "name": name,
                     "chain": "liquid-testnet",
                     "role": role,
                     "address": address,
-                    "lbtc_sats": null,
-                    "balances_sats": null,
                     "explorer": format!(
                         "{}/address/{}",
                         cfg.explorer_base.trim_end_matches('/'),
                         address
                     ),
                     "source": "public-address-registry",
-                }));
+                });
+                merge_balance_fields(&mut wallet, balance_snapshot.wallet(name));
+                wallets.push(wallet);
             }
         }
     }
 
     Ok(serde_json::json!({
         "updated": true,
-        "note": "Read-only demo board. No send/swap actions from the browser.",
+        "note": "Read-only demo board. Liquid values are aggregate testnet wallet balances synchronized server-side with LWK; no keys reach the browser.",
+        "balance_cache": {
+            "source": balance_snapshot.source,
+            "refresh_secs": balance_snapshot.refresh_secs,
+            "max_stale_secs": balance_snapshot.max_stale_secs,
+        },
         "wallets": wallets,
     }))
 }

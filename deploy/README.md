@@ -289,6 +289,63 @@ for S in rgbmvp-demo-btc-alice-wif rgbmvp-demo-bob-mnemonic rgbmvp-demo-exit-see
 done
 ```
 
+### 5.3.1 Liquid watch-only balance bundle
+
+`GET /v1/demo/wallets` publishes aggregate **testnet L-BTC** balances for the
+five predefined Liquid wallets. Blockstream cannot calculate confidential
+Liquid amounts from an address alone, so labd synchronizes them server-side
+with LWK/Electrum. The input is a dedicated watch bundle containing xpub
+derivation plus SLIP77 blinding material. It can reveal these testnet wallet
+amounts but cannot sign.
+
+Do **not** upload `fixtures/testnet_wallets.json`: it contains public fixture
+mnemonics and would give the runtime unnecessary signing material. Build the
+bundle from the already-derived local descriptor files, verify every primary
+address against the addresses-only registry, and stream it directly to Secret
+Manager without writing another copy:
+
+```bash
+for NAME in alice bob carol lab0 maker; do
+  FILE=".rgbmvp/wallets/${NAME}/descriptor"
+  test -s "$FILE"
+  ! grep -Eiq 'xprv|tprv|uprv|vprv' "$FILE"
+  LOCAL_ADDR=$(./target/debug/rgbmvp wallet address --name "$NAME" --index 0 | jq -r .address)
+  REGISTRY_ADDR=$(jq -r --arg name "$NAME" '.wallets[] | select(.name == $name) | .address_0' \
+    .rgbmvp/wallet_registry.json)
+  test "$LOCAL_ADDR" = "$REGISTRY_ADDR"
+done
+
+gcloud secrets create rgbmvp-demo-liquid-watch-bundle --project "$PROJECT" \
+  --replication-policy=automatic 2>/dev/null || true
+
+jq -n \
+  --rawfile alice .rgbmvp/wallets/alice/descriptor \
+  --rawfile bob .rgbmvp/wallets/bob/descriptor \
+  --rawfile carol .rgbmvp/wallets/carol/descriptor \
+  --rawfile lab0 .rgbmvp/wallets/lab0/descriptor \
+  --rawfile maker .rgbmvp/wallets/maker/descriptor \
+  '{version:1,network:"liquid-testnet",wallets:[
+    {name:"alice",descriptor:($alice|rtrimstr("\n"))},
+    {name:"bob",descriptor:($bob|rtrimstr("\n"))},
+    {name:"carol",descriptor:($carol|rtrimstr("\n"))},
+    {name:"lab0",descriptor:($lab0|rtrimstr("\n"))},
+    {name:"maker",descriptor:($maker|rtrimstr("\n"))}
+  ]}' | gcloud secrets versions add rgbmvp-demo-liquid-watch-bundle \
+    --project "$PROJECT" --data-file=-
+
+gcloud secrets add-iam-policy-binding rgbmvp-demo-liquid-watch-bundle \
+  --project "$PROJECT" \
+  --member="serviceAccount:rgbmvp-demo-run@${PROJECT}.iam.gserviceaccount.com" \
+  --role=roles/secretmanager.secretAccessor
+```
+
+`deploy/cloudrun-demo.yaml` pins reviewed bundle version `1` at
+`/secrets-watch/liquid-watch.json`. That path is deliberately excluded from
+`RGBMVP_SECRET_DIR`, so custody/signing resolution cannot consume it. The board
+caches successful scans for 120 seconds and may display an explicitly marked
+stale value for at most 15 minutes; T1 admission uses a separate fresh,
+fail-closed cache.
+
 ### 5.4 Deploy
 
 Edit `deploy/cloudrun-demo.yaml`, replacing `PROJECT`, `REGION`, `TAG`,
@@ -321,6 +378,8 @@ curl -s "$URL/v1/security" | jq '.public_read_only'          # expect true
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/v1/swap/init" -d '{}'   # expect 403
 # Demo quota visible, budget intact
 curl -s "$URL/v1/demo/quota" | jq '{enabled, leg_sats, rgb_wrap, budget, floats}'
+# Five Liquid balances are LWK-synchronized and carry freshness metadata.
+curl -s "$URL/v1/demo/wallets" | jq '{balance_cache, liquid:[.wallets[] | select(.chain == "liquid-testnet") | {name,lbtc_sats,balance_status,balance_as_of_epoch}]}'
 # Demo trigger rejects a missing bot token
 curl -s -X POST "$URL/v1/demo/swap" -H 'content-type: application/json' -d '{}' | jq '.code'
 #   expect "turnstile_required"

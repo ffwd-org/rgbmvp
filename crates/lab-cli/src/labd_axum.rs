@@ -32,6 +32,7 @@ use crate::http_api::{
     handle_rgb_issue_post, handle_rgb_transfer_post, handle_swap_action_post,
     handle_swap_init_post, handle_verify_post, list_rgb_contracts, list_swap_ids, public_swap_view,
 };
+use crate::wallet_watch::WalletBalanceBoard;
 
 #[derive(Clone)]
 struct AppState {
@@ -44,6 +45,8 @@ struct AppState {
     /// Anonymous fixed-parameter RGB lab, with an independent durable budget.
     rgb_demo: Arc<DemoGovernor>,
     demo_floats: Arc<FloatCache>,
+    /// Display-only Liquid balance cache; never used for spend admission.
+    wallet_balance_board: Arc<WalletBalanceBoard>,
     demo_wallets: DemoWallets,
     demo_fees: DemoFees,
     /// Exact number of trusted proxy entries at the right edge of XFF.
@@ -183,6 +186,16 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
             rgb_demo.policy().fee_budget_sats
         );
     }
+    let wallet_balance_board = Arc::new(
+        WalletBalanceBoard::from_config(&cfg)
+            .context("public wallet balance board configuration refused")?,
+    );
+    eprintln!(
+        "  demo wallet balances: source={} wallets={} refresh={}s",
+        wallet_balance_board.source(),
+        wallet_balance_board.configured_wallets(),
+        wallet_balance_board.refresh_secs()
+    );
     let state = AppState {
         cfg: cfg.clone(),
         web_dir,
@@ -191,6 +204,7 @@ async fn serve_async(cfg: Config, bind: String) -> Result<()> {
         demo,
         rgb_demo,
         demo_floats: Arc::new(FloatCache::new()),
+        wallet_balance_board,
         demo_wallets: DemoWallets::from_env(),
         demo_fees: DemoFees::from_env(),
         client_ip_policy,
@@ -733,8 +747,16 @@ async fn v1_swap_action(
 
 async fn v1_demo_wallets(State(s): State<AppState>) -> Response {
     let cfg = s.cfg.clone();
-    match tokio::task::spawn_blocking(move || demo_wallets(&cfg)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
+    let balance_board = s.wallet_balance_board.clone();
+    match tokio::task::spawn_blocking(move || demo_wallets(&cfg, &balance_board)).await {
+        Ok(Ok(v)) => {
+            let mut response = Json(v).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
+            response
+        }
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -1285,6 +1307,7 @@ mod tests {
             demo: Arc::new(DemoGovernor::new(demo_policy)),
             rgb_demo: Arc::new(DemoGovernor::new(lab_core::DemoSwapPolicy::default())),
             demo_floats: Arc::new(FloatCache::new()),
+            wallet_balance_board: Arc::new(WalletBalanceBoard::empty()),
             demo_wallets: DemoWallets {
                 alice_btc: "btc-alice".into(),
                 bob_lq: "bob".into(),
@@ -1498,6 +1521,48 @@ mod tests {
         let dump = v.to_string();
         for bad in ["mnemonic", "preimage", "wif", "descriptor"] {
             assert!(!dump.contains(bad), "quota JSON must not expose {bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn demo_wallet_board_is_uncached_and_leaks_no_watch_material() {
+        let state = test_state();
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/demo/wallets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["wallets"].is_array());
+        assert_eq!(v["balance_cache"]["source"], json!("address-registry"));
+        let dump = v.to_string().to_ascii_lowercase();
+        for bad in [
+            "mnemonic",
+            "preimage",
+            "descriptor",
+            "slip77",
+            "xpub",
+            "tpub",
+            "xprv",
+            "tprv",
+            "/secrets",
+        ] {
+            assert!(!dump.contains(bad), "wallet JSON must not expose {bad}");
         }
     }
 

@@ -97,6 +97,10 @@ Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
 - Per-IP quotas use `LABD_XFF_TRUSTED_HOPS`, the exact trusted right-edge XFF
   suffix length. Never restore the Boolean `LABD_TRUST_XFF`, select the
   rightmost entry, accept invalid IP tokens, or trust XFF on an unverified path.
+- `/v1/demo/wallets` may publish aggregate testnet L-BTC only from the dedicated
+  watch-only bundle (`RGBMVP_LIQUID_WATCH_BUNDLE`). Keep that mount outside
+  `RGBMVP_SECRET_DIR`, reject spending private keys and address mismatches, and
+  never feed its display/stale cache into T1 admission or signing paths.
 
 ## Local development
 

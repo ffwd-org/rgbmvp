@@ -17,6 +17,7 @@ mod demo_swap;
 mod http_api;
 mod labd_axum;
 mod labd_legacy;
+mod wallet_watch;
 mod rgb_demo;
 
 #[derive(Parser, Debug)]

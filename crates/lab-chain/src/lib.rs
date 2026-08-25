@@ -189,6 +189,20 @@ pub fn wallet_address(cfg: &Config, name: &str, index: Option<u32>) -> Result<Wa
         name
     };
     let descriptor = load_descriptor(cfg, name)?;
+    wallet_address_from_descriptor(cfg, name, &descriptor, index)
+}
+
+/// Derive a Liquid Testnet address from an already-loaded watch descriptor.
+///
+/// This is intentionally read-only: callers get a `Wollet`, never a signer.
+/// Public deployments use it for the demo board's Secret Manager-backed
+/// watch-only descriptor bundle.
+pub fn wallet_address_from_descriptor(
+    cfg: &Config,
+    name: &str,
+    descriptor: &str,
+    index: Option<u32>,
+) -> Result<WalletAddressResult> {
     let wollet = open_wollet(&descriptor)?;
     let addr = wollet
         .address(index)
@@ -209,6 +223,18 @@ pub fn wallet_balance(cfg: &Config, name: &str) -> Result<WalletBalanceResult> {
         name
     };
     let descriptor = load_descriptor(cfg, name)?;
+    wallet_balance_from_descriptor(cfg, name, &descriptor)
+}
+
+/// Synchronize and aggregate a Liquid Testnet wallet from a watch descriptor.
+///
+/// The descriptor may contain SLIP77 blinding material so controlled outputs
+/// can be unblinded, but this path constructs no signer and cannot spend.
+pub fn wallet_balance_from_descriptor(
+    cfg: &Config,
+    name: &str,
+    descriptor: &str,
+) -> Result<WalletBalanceResult> {
     let mut wollet = open_wollet(&descriptor)?;
 
     let url = ElectrumUrl::new(

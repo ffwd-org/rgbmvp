@@ -176,7 +176,7 @@ rgbmvp serve --bind 127.0.0.1:8080
 | GET | `/v1` | Catalog JSON |
 | GET | `/v1/health` | Network + `rgb_ready` |
 | GET | `/v1/phases` | Ladder chip statuses |
-| GET | `/v1/demo/wallets` · `/v1/demo/activity` | Board |
+| GET | `/v1/demo/wallets` · `/v1/demo/activity` | Board; BTC via Esplora, confidential L-BTC via server-side watch-only LWK sync with explicit live/stale metadata |
 | GET | `/v1/demo/rgb/quota` | Fixed RGB lab parameters, limits, and usage |
 | POST | `/v1/demo/rgb/run` | Anonymous Turnstile-gated fixed `bob → alice` Issue → Transfer → Verify |
 | POST | `/v1/rgb/issue` · `/v1/rgb/transfer` · `/v1/rgb/verify` | Server-side lab wallets |
