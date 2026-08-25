@@ -19,6 +19,9 @@ pub enum SwapPhase {
     ClaimedLq,
     ClaimedBtc,
     Done,
+    /// At least one funded leg was refunded, while another funded leg still
+    /// needs its own refund after CSV maturity.
+    Refunding,
     Refunded,
 }
 
@@ -77,6 +80,12 @@ pub struct SwapSession {
     pub lq_fund_sats: Option<u64>,
     pub lq_claim_txid: Option<String>,
     pub btc_claim_txid: Option<String>,
+    /// Refunds are tracked per leg. Older sessions recorded these only in
+    /// `notes`; [`hydrate_legacy_refund_txids`] upgrades them on load.
+    #[serde(default)]
+    pub lq_refund_txid: Option<String>,
+    #[serde(default)]
+    pub btc_refund_txid: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -236,6 +245,8 @@ pub fn init_swap(
         lq_fund_sats: None,
         lq_claim_txid: None,
         btc_claim_txid: None,
+        lq_refund_txid: None,
+        btc_refund_txid: None,
         notes,
     })
 }
@@ -336,7 +347,17 @@ pub fn check_leg_contract_matches_session(
 }
 
 pub fn recompute_phase(s: &mut SwapSession) {
-    if matches!(s.phase, SwapPhase::Refunded) {
+    let any_refund = s.btc_refund_txid.is_some() || s.lq_refund_txid.is_some();
+    if any_refund {
+        let btc_resolved =
+            s.btc_fund_txid.is_none() || s.btc_claim_txid.is_some() || s.btc_refund_txid.is_some();
+        let lq_resolved =
+            s.lq_fund_txid.is_none() || s.lq_claim_txid.is_some() || s.lq_refund_txid.is_some();
+        s.phase = if btc_resolved && lq_resolved {
+            SwapPhase::Refunded
+        } else {
+            SwapPhase::Refunding
+        };
         return;
     }
     let btc = s.btc_fund_txid.is_some();
@@ -352,6 +373,51 @@ pub fn recompute_phase(s: &mut SwapSession) {
         (false, true, _, _) => SwapPhase::FundedLq,
         _ => SwapPhase::Created,
     };
+}
+
+/// Upgrade sessions written before refund txids had dedicated fields.
+///
+/// Returns true when the session changed and should be persisted. This keeps a
+/// crash between two leg refunds recoverable instead of treating the first
+/// refund as terminal for the whole swap.
+pub fn hydrate_legacy_refund_txids(s: &mut SwapSession) -> bool {
+    let before_btc = s.btc_refund_txid.clone();
+    let before_lq = s.lq_refund_txid.clone();
+    if s.btc_refund_txid.is_none() {
+        s.btc_refund_txid = refund_txid_from_notes(&s.notes, "btc_refund_txid=");
+    }
+    if s.lq_refund_txid.is_none() {
+        s.lq_refund_txid = refund_txid_from_notes(&s.notes, "lq_refund_txid=");
+    }
+    let changed = s.btc_refund_txid != before_btc || s.lq_refund_txid != before_lq;
+    if changed || matches!(s.phase, SwapPhase::Refunded | SwapPhase::Refunding) {
+        let before_phase = s.phase.clone();
+        recompute_phase(s);
+        return changed || s.phase != before_phase;
+    }
+    false
+}
+
+fn refund_txid_from_notes(notes: &[String], prefix: &str) -> Option<String> {
+    notes
+        .iter()
+        .rev()
+        .find_map(|note| note.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|txid| !txid.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn record_btc_refund(s: &mut SwapSession, txid: String) {
+    s.notes.push(format!("btc_refund_txid={txid}"));
+    s.btc_refund_txid = Some(txid);
+    recompute_phase(s);
+}
+
+pub fn record_lq_refund(s: &mut SwapSession, txid: String) {
+    s.notes.push(format!("lq_refund_txid={txid}"));
+    s.lq_refund_txid = Some(txid);
+    recompute_phase(s);
 }
 
 /// Mark both value claims complete (test / offline helper). Does not set RGB verifies.
@@ -408,6 +474,55 @@ mod tests {
         assert!(!s.rgb_wrap);
         assert_eq!(s.version, 1);
         assert!(s.btc_rgb.is_none());
+        assert!(s.btc_refund_txid.is_none());
+        assert!(s.lq_refund_txid.is_none());
+    }
+
+    #[test]
+    fn partial_refund_is_not_terminal_until_every_funded_leg_resolves() {
+        let mut s = init_swap(
+            &htlc::test_keyring(),
+            "partial-refund",
+            6,
+            "btc-alice",
+            "bob",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        s.btc_fund_txid = Some("btc-fund".into());
+        s.lq_fund_txid = Some("lq-fund".into());
+
+        record_lq_refund(&mut s, "lq-refund".into());
+        assert_eq!(s.phase, SwapPhase::Refunding);
+        assert!(s.btc_refund_txid.is_none());
+
+        record_btc_refund(&mut s, "btc-refund".into());
+        assert_eq!(s.phase, SwapPhase::Refunded);
+    }
+
+    #[test]
+    fn legacy_refund_note_hydrates_partial_state_for_retry() {
+        let mut s = init_swap(
+            &htlc::test_keyring(),
+            "legacy-partial-refund",
+            6,
+            "btc-alice",
+            "bob",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        s.btc_fund_txid = Some("btc-fund".into());
+        s.lq_fund_txid = Some("lq-fund".into());
+        s.notes.push("lq_refund_txid=legacy-lq-refund".into());
+        s.phase = SwapPhase::Refunded;
+
+        assert!(hydrate_legacy_refund_txids(&mut s));
+        assert_eq!(s.lq_refund_txid.as_deref(), Some("legacy-lq-refund"));
+        assert_eq!(s.phase, SwapPhase::Refunding);
     }
 
     #[test]

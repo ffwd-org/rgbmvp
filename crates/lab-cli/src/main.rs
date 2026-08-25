@@ -1161,8 +1161,12 @@ fn run() -> Result<()> {
                 }
                 SwapCmd::RefundBtc { id, fee_sats } => {
                     let mut s = store.load(&id)?;
+                    lab_rgb::swap::hydrate_legacy_refund_txids(&mut s);
                     if s.btc_claim_txid.is_some() {
                         anyhow::bail!("BTC already claimed; cannot refund");
+                    }
+                    if s.btc_refund_txid.is_some() {
+                        anyhow::bail!("BTC already refunded");
                     }
                     let btc = lab_btc::BtcConfig::from_env();
                     let amount = s.btc_fund_sats.context("btc not funded")?;
@@ -1194,8 +1198,7 @@ fn run() -> Result<()> {
                         &refund_sk,
                     )?;
                     let txid = lab_btc::broadcast_raw(&btc, &raw)?;
-                    s.notes.push(format!("btc_refund_txid={txid}"));
-                    s.phase = lab_rgb::swap::SwapPhase::Refunded;
+                    lab_rgb::swap::record_btc_refund(&mut s, txid.clone());
                     store.save(&s)?;
                     println!(
                         "{}",
@@ -1211,8 +1214,12 @@ fn run() -> Result<()> {
                 }
                 SwapCmd::RefundLq { id, fee_sats } => {
                     let mut s = store.load(&id)?;
+                    lab_rgb::swap::hydrate_legacy_refund_txids(&mut s);
                     if s.lq_claim_txid.is_some() {
                         anyhow::bail!("Liquid already claimed; cannot refund");
+                    }
+                    if s.lq_refund_txid.is_some() {
+                        anyhow::bail!("Liquid already refunded");
                     }
                     let amount = s.lq_fund_sats.context("lq not funded")?;
                     let (txid, vout, value) = lab_chain::find_address_utxo(
@@ -1246,8 +1253,7 @@ fn run() -> Result<()> {
                         &refund_sk,
                     )?;
                     let claim_txid = lab_chain::broadcast_raw_hex(&cfg, &raw)?;
-                    s.notes.push(format!("lq_refund_txid={claim_txid}"));
-                    s.phase = lab_rgb::swap::SwapPhase::Refunded;
+                    lab_rgb::swap::record_lq_refund(&mut s, claim_txid.clone());
                     store.save(&s)?;
                     println!(
                         "{}",

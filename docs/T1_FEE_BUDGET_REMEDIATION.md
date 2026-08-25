@@ -87,6 +87,7 @@ is conservatively committed.
 | Before pending is durable | No session or broadcast has started; request fails |
 | Pending durable, primary incomplete | Pending record is authoritative |
 | Admission durable, before or after broadcast | Restart commits the full reservation |
+| Crash after both funds, one leg refunds first | Session stays `refunding`; watcher retries the unresolved leg after its independent CSV maturity |
 | Driver complete, settlement write fails | Prior durable reservation remains charged |
 | Pending or primary malformed/unreadable | Startup refuses T1 |
 | Persistent storage unavailable | Admission returns 503 before session creation |

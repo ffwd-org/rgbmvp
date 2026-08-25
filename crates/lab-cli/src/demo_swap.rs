@@ -813,11 +813,11 @@ fn recycle_btc_exits_blocking(cfg: &Config, wallets: &DemoWallets, fee_sats: u64
 
 /// True when a session still has value parked in an HTLC.
 fn needs_btc_refund(s: &lab_rgb::swap::SwapSession) -> bool {
-    s.btc_fund_txid.is_some() && s.btc_claim_txid.is_none()
+    s.btc_fund_txid.is_some() && s.btc_claim_txid.is_none() && s.btc_refund_txid.is_none()
 }
 
 fn needs_lq_refund(s: &lab_rgb::swap::SwapSession) -> bool {
-    s.lq_fund_txid.is_some() && s.lq_claim_txid.is_none()
+    s.lq_fund_txid.is_some() && s.lq_claim_txid.is_none() && s.lq_refund_txid.is_none()
 }
 
 /// Refund stuck demo swaps, then sweep the recovered value back to the funder.
@@ -860,7 +860,7 @@ pub fn sweep_stuck_demo_swaps_blocking(
             report.skipped_young += 1;
             continue;
         }
-        let s = match store.load(&id) {
+        let mut s = match store.load(&id) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("demo sweep: load {id}: {e:#}");
@@ -868,6 +868,13 @@ pub fn sweep_stuck_demo_swaps_blocking(
                 continue;
             }
         };
+        if lab_rgb::swap::hydrate_legacy_refund_txids(&mut s) {
+            if let Err(e) = store.save(&s) {
+                eprintln!("demo sweep: save upgraded refund state {id}: {e:#}");
+                report.errors += 1;
+                continue;
+            }
+        }
         if matches!(
             s.phase,
             lab_rgb::swap::SwapPhase::Done | lab_rgb::swap::SwapPhase::Refunded
@@ -1011,6 +1018,31 @@ mod tests {
                 "generated id must satisfy the path-id rules: {id}"
             );
         }
+    }
+
+    #[test]
+    fn watcher_retries_only_the_unresolved_leg_after_partial_refund() {
+        let mut s = lab_rgb::swap::init_swap(
+            &lab_rgb::htlc::DemoKeyring::new([0x42; 32]).unwrap(),
+            "demo-partial-refund",
+            6,
+            "btc-alice",
+            "bob",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        s.btc_fund_txid = Some("btc-fund".into());
+        s.lq_fund_txid = Some("lq-fund".into());
+        s.notes.push("lq_refund_txid=lq-refund".into());
+        s.phase = lab_rgb::swap::SwapPhase::Refunded;
+
+        assert!(lab_rgb::swap::hydrate_legacy_refund_txids(&mut s));
+
+        assert!(needs_btc_refund(&s));
+        assert!(!needs_lq_refund(&s));
+        assert_eq!(s.phase, lab_rgb::swap::SwapPhase::Refunding);
     }
 
     /// The driver must never emit an RGB-wrapped or oversized leg.
