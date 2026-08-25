@@ -1200,11 +1200,12 @@ async fn v1_demo_rgb_run(
     let run_cfg = s.cfg.clone();
     let result = tokio::task::spawn_blocking(move || crate::rgb_demo::run(&run_cfg)).await;
     let response = match result {
-        Ok(Ok(value)) => {
-            // The chain helper does not yet expose an exact fee. Charge the full
-            // conservative reservation rather than under-accounting a run.
-            s.rgb_demo.finish(s.rgb_demo.policy().max_fee_per_swap_sats);
-            (StatusCode::OK, Json(value)).into_response()
+        Ok(Ok(run)) => {
+            // Admission remains reserved at the conservative maximum. A proven
+            // successful broadcast settles the exact sender debit; unknown
+            // outcomes remain charged in full below.
+            s.rgb_demo.finish(run.sender_debit_sats);
+            (StatusCode::OK, Json(run.public)).into_response()
         }
         Ok(Err(error)) => {
             // A broadcast may already have happened. Unknown outcomes stay
@@ -1550,6 +1551,8 @@ mod tests {
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(v["wallets"].is_array());
         assert_eq!(v["balance_cache"]["source"], json!("address-registry"));
+        assert_eq!(v["rebalance"]["mutation_available"], json!(false));
+        assert_eq!(v["rebalance"]["plan"]["status"], json!("unavailable"));
         let dump = v.to_string().to_ascii_lowercase();
         for bad in [
             "mnemonic",
@@ -1660,6 +1663,7 @@ mod tests {
 
         for path in [
             "/v1/demo/rgb/run/extra",
+            "/v1/demo/rebalance",
             "/v1/rgb/issue",
             "/v1/rgb/transfer",
             "/v1/rgb/verify",

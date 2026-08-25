@@ -412,6 +412,20 @@ enum WalletCmd {
         #[arg(long)]
         amount_sats: u64,
     },
+    /// Plan or apply the fixed Alice -> Bob public RGB-demo rebalance
+    RebalanceDemo {
+        #[arg(long, default_value_t = crate::rgb_demo::REBALANCE_TRIGGER_SATS)]
+        trigger_below_sats: u64,
+        #[arg(long, default_value_t = crate::rgb_demo::REBALANCE_TARGET_SATS)]
+        target_sats: u64,
+        #[arg(long, default_value_t = crate::rgb_demo::REBALANCE_SOURCE_FLOOR_SATS)]
+        source_floor_sats: u64,
+        #[arg(long, default_value_t = crate::rgb_demo::REBALANCE_MAX_TRANSFER_SATS)]
+        max_transfer_sats: u64,
+        /// Broadcast the bounded transfer; omitted means dry-run
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -636,6 +650,60 @@ fn run() -> Result<()> {
                         amount_sats
                     )?)?
                 );
+            }
+            WalletCmd::RebalanceDemo {
+                trigger_below_sats,
+                target_sats,
+                source_floor_sats,
+                max_transfer_sats,
+                apply,
+            } => {
+                anyhow::ensure!(
+                    target_sats >= trigger_below_sats,
+                    "target-sats must be at least trigger-below-sats"
+                );
+                let policy = crate::rgb_demo::RebalancePolicy {
+                    trigger_below_sats,
+                    target_sats,
+                    source_floor_sats,
+                    max_transfer_sats,
+                };
+                let alice = lab_chain::wallet_balance(&cfg, crate::rgb_demo::RECEIVER_WALLET)?;
+                let bob = lab_chain::wallet_balance(&cfg, crate::rgb_demo::SENDER_WALLET)?;
+                let plan = crate::rgb_demo::rebalance_plan(
+                    Some(alice.lbtc_sats),
+                    Some(bob.lbtc_sats),
+                    policy,
+                );
+                if !apply || plan.recommended_amount_sats == 0 {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "mode": "dry-run",
+                            "broadcast": false,
+                            "plan": plan,
+                            "apply_hint": "Re-run with --apply only after reviewing this plan."
+                        }))?
+                    );
+                } else {
+                    let destination =
+                        lab_chain::wallet_receive_address(&cfg, crate::rgb_demo::SENDER_WALLET)?;
+                    let result = lab_chain::send_lbtc(
+                        &cfg,
+                        crate::rgb_demo::RECEIVER_WALLET,
+                        &destination,
+                        plan.recommended_amount_sats,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "mode": "apply",
+                            "broadcast": true,
+                            "plan": plan,
+                            "result": result
+                        }))?
+                    );
+                }
             }
         },
         Commands::Rgb { cmd } => match cmd {

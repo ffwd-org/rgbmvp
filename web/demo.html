@@ -69,6 +69,9 @@
   <h2>Wallets</h2>
   <div class="grid" id="wallets"><div class="muted">Loading…</div></div>
 
+  <h2>Float health</h2>
+  <div class="card" id="rebalance"><div class="muted">Loading…</div></div>
+
   <h2>Swaps</h2>
   <div class="card" id="swaps"><div class="muted">Loading…</div></div>
 
@@ -137,6 +140,18 @@
         if (!(w.wallets || []).length) {
           wg.innerHTML = '<div class="muted">No wallets. Run bootstrap-testnet + btc import-env.</div>';
         }
+
+        const rb = w.rebalance || {};
+        const rp = rb.plan || {};
+        const state = rp.status || 'unavailable';
+        const amount = Number(rp.recommended_amount_sats || 0);
+        $('rebalance').innerHTML = `
+          <div class="chain">READ-ONLY · OPERATOR CONTROLLED</div>
+          <h3>RGB demo liquidity: ${esc(state)}</h3>
+          <div class="bal">${amount ? esc(fmtSats(amount)) + ' recommended' : 'No transfer recommended'}</div>
+          <p class="muted">${esc(rp.reason || 'Live balance status is unavailable.')}</p>
+          <p class="muted">Alice ${esc(fmtSats(rp.source_balance_sats))} → Bob ${esc(fmtSats(rp.destination_balance_sats))}. Browser rebalancing is disabled; the fixed operator command defaults to dry-run. Swap exits are recycled automatically.</p>
+        `;
 
         const swaps = a.swaps || [];
         if (!swaps.length) {

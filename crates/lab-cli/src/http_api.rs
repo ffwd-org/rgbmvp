@@ -763,6 +763,17 @@ pub(crate) fn demo_wallets(
     let btc = lab_btc::BtcConfig::from_env();
     let mut wallets = Vec::new();
     let balance_snapshot = balance_board.snapshot_blocking(cfg);
+    let alice_balance = balance_snapshot.wallet(crate::rgb_demo::RECEIVER_WALLET);
+    let bob_balance = balance_snapshot.wallet(crate::rgb_demo::SENDER_WALLET);
+    let rebalance = crate::rgb_demo::rebalance_plan(
+        (alice_balance.balance_status == "live")
+            .then_some(alice_balance.lbtc_sats)
+            .flatten(),
+        (bob_balance.balance_status == "live")
+            .then_some(bob_balance.lbtc_sats)
+            .flatten(),
+        crate::rgb_demo::rebalance_policy_from_env(),
+    );
 
     for name in ["alice", "bob", "carol", "maker", "lab0"] {
         if !cfg.wallet_path(name).join("descriptor").exists() {
@@ -898,6 +909,14 @@ pub(crate) fn demo_wallets(
             "source": balance_snapshot.source,
             "refresh_secs": balance_snapshot.refresh_secs,
             "max_stale_secs": balance_snapshot.max_stale_secs,
+        },
+        "rebalance": {
+            "mutation_available": false,
+            "plan": rebalance,
+            "source_balance_status": alice_balance.balance_status,
+            "destination_balance_status": bob_balance.balance_status,
+            "operator_command": "rgbmvp wallet rebalance-demo",
+            "note": "Status only. Rebalancing is never exposed as an anonymous browser mutation; swaps recycle their own exit outputs."
         },
         "wallets": wallets,
     }))

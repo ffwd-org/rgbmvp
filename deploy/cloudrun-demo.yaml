@@ -200,6 +200,16 @@ spec:
               value: "1"
             - name: LABD_RGB_DEMO_LQ_FLOOR_SATS
               value: "20000"
+            # Read-only board guidance for the operator-only Alice -> Bob
+            # rebalance command. No public rebalance endpoint exists.
+            - name: LABD_RGB_DEMO_REBALANCE_TRIGGER_SATS
+              value: "50000"
+            - name: LABD_RGB_DEMO_REBALANCE_TARGET_SATS
+              value: "100000"
+            - name: LABD_RGB_DEMO_REBALANCE_SOURCE_FLOOR_SATS
+              value: "20000"
+            - name: LABD_RGB_DEMO_REBALANCE_MAX_TRANSFER_SATS
+              value: "25000"
             # Google External Application Load Balancers append
             # client-ip,load-balancer-ip. Discard the one trusted right-edge
             # proxy entry and select the next-to-last IP. Verify this exact
