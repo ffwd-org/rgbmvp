@@ -96,7 +96,8 @@ spec:
               # Swap sessions contain a private preimage. Cloud Storage FUSE
               # controls permissions at mount time and does not support normal
               # per-object chmod, so the mount itself must present files 0600.
-              mountOptions: file-mode=600,dir-mode=700
+              # Dockerfile.public runs as Debian's nobody (65534:65534).
+              mountOptions: uid=65534,gid=65534,file-mode=600,dir-mode=700
       containers:
         - image: REGION-docker.pkg.dev/PROJECT/rgbmvp/rgbmvp-public:TAG
           ports:

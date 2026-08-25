@@ -69,8 +69,10 @@ record blocks startup; it never falls back to zero.
 
 The same volume stores swap sessions, which contain the private preimage needed
 to settle or refund a swap. `deploy/cloudrun-demo.yaml` therefore mounts Cloud
-Storage FUSE with `file-mode=600,dir-mode=700`. Session persistence verifies an
-effective mode of exactly `0600` and fails before execution if the mount is
+Storage FUSE with
+`uid=65534,gid=65534,file-mode=600,dir-mode=700`, matching the Debian `nobody`
+runtime identity declared by `Dockerfile.public`. Session persistence verifies
+an effective mode of exactly `0600` and fails before execution if the mount is
 insecure. It sets the creation mode and verifies it before writing any preimage
 bytes; it never relies on `chmod`, because Cloud Storage FUSE controls modes
 globally rather than per object.
