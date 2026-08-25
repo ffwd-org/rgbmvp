@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>rgbmvp — RGB on Liquid testnet lab</title>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onRgbDemoTurnstileLoad&render=explicit" defer></script>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f2f4ee; background: #080b0a; --ink:#f2f4ee; --muted:#a5aea3; --line:#303a32; --surface:#111713; --surface-2:#171e19; --accent:#b7ff3c; --teal:#22e1c9; --amber:#ffc857; --bad:#ff7b7b; }
     * { box-sizing: border-box; }
@@ -471,6 +471,35 @@
 
     let rgbDemoWidgetId = null;
     let rgbDemoToken = '';
+    let rgbDemoQuota = null;
+
+    function mountPublicRgbDemoBotCheck() {
+      const status = $('rgb-demo-status');
+      const button = $('rgb-demo-run');
+      if (!rgbDemoQuota || !rgbDemoQuota.enabled) return;
+      if (!rgbDemoQuota.turnstile_sitekey) {
+        status.textContent = 'Bot check unavailable; the flow remains fail-closed.';
+        return;
+      }
+      if (!window.turnstile) {
+        status.textContent = 'Loading bot check…';
+        return;
+      }
+      if (rgbDemoWidgetId !== null) return;
+      try {
+        rgbDemoWidgetId = window.turnstile.render('#rgb-demo-turnstile', {
+          sitekey: rgbDemoQuota.turnstile_sitekey,
+          action: rgbDemoQuota.turnstile_action || 'rgbmvp_rgb_lab',
+          callback: token => { rgbDemoToken = token; button.disabled = false; status.textContent = 'Bot check complete. Ready to run.'; },
+          'expired-callback': () => { rgbDemoToken = ''; button.disabled = true; },
+          'error-callback': () => { rgbDemoToken = ''; button.disabled = true; status.textContent = 'Bot check failed; retry the widget.'; }
+        });
+      } catch (error) {
+        status.textContent = 'Bot check unavailable; the flow remains fail-closed: ' + error;
+      }
+    }
+
+    window.onRgbDemoTurnstileLoad = mountPublicRgbDemoBotCheck;
 
     async function setupPublicRgbDemo() {
       const status = $('rgb-demo-status');
@@ -489,20 +518,8 @@
           status.textContent = 'The anonymous RGB flow is currently disabled.';
           return;
         }
-        if (!q.turnstile_sitekey || !window.turnstile) {
-          status.textContent = 'Bot check unavailable; the flow remains fail-closed.';
-          return;
-        }
-        window.turnstile.ready(() => {
-          if (rgbDemoWidgetId !== null) return;
-          rgbDemoWidgetId = window.turnstile.render('#rgb-demo-turnstile', {
-            sitekey: q.turnstile_sitekey,
-            action: q.turnstile_action || 'rgbmvp_rgb_lab',
-            callback: token => { rgbDemoToken = token; button.disabled = false; status.textContent = 'Bot check complete. Ready to run.'; },
-            'expired-callback': () => { rgbDemoToken = ''; button.disabled = true; },
-            'error-callback': () => { rgbDemoToken = ''; button.disabled = true; status.textContent = 'Bot check failed; retry the widget.'; }
-          });
-        });
+        rgbDemoQuota = q;
+        mountPublicRgbDemoBotCheck();
       } catch (error) {
         status.textContent = 'RGB demo status unavailable: ' + error;
       }
