@@ -62,11 +62,15 @@ pub fn public_swap_view(s: &SwapSession, lq_explorer: &str, btc_explorer: &str) 
         "lq_fund_sats": s.lq_fund_sats,
         "lq_claim_txid": s.lq_claim_txid,
         "btc_claim_txid": s.btc_claim_txid,
+        "lq_refund_txid": s.lq_refund_txid,
+        "btc_refund_txid": s.btc_refund_txid,
         "links": {
             "btc_fund": tx_link(btc_explorer, &s.btc_fund_txid),
             "lq_fund": tx_link(lq_explorer, &s.lq_fund_txid),
             "lq_claim": tx_link(lq_explorer, &s.lq_claim_txid),
             "btc_claim": tx_link(btc_explorer, &s.btc_claim_txid),
+            "lq_refund": tx_link(lq_explorer, &s.lq_refund_txid),
+            "btc_refund": tx_link(btc_explorer, &s.btc_refund_txid),
         },
         "notes": s.notes,
         "steps": [
@@ -75,6 +79,8 @@ pub fn public_swap_view(s: &SwapSession, lq_explorer: &str, btc_explorer: &str) 
             {"id": "funded_lq", "done": s.lq_fund_txid.is_some(), "label": "Fund Liquid HTLC"},
             {"id": "claimed_lq", "done": s.lq_claim_txid.is_some(), "label": "Alice claims LQ (reveals preimage)"},
             {"id": "claimed_btc", "done": s.btc_claim_txid.is_some(), "label": "Bob claims BTC"},
+            {"id": "refunded_lq", "done": s.lq_refund_txid.is_some(), "label": "Bob refunds LQ after CSV"},
+            {"id": "refunded_btc", "done": s.btc_refund_txid.is_some(), "label": "Alice refunds BTC after CSV"},
             {"id": "done", "done": matches!(s.phase, SwapPhase::Done), "label": "Done"},
         ],
     })
@@ -106,5 +112,24 @@ mod tests {
         // Ensure raw preimage string is not embedded elsewhere.
         let dump = v.to_string();
         assert!(!dump.contains(&s.preimage_hex));
+    }
+
+    #[test]
+    fn public_view_exposes_partial_refund_progress_without_secrets() {
+        let keyring = lab_rgb::htlc::DemoKeyring::new([0x43; 32]).unwrap();
+        let mut s = init_swap(&keyring, "partial", 6, "a", "b", None, None, false).unwrap();
+        s.btc_fund_txid = Some("btc-fund".into());
+        s.lq_fund_txid = Some("lq-fund".into());
+        lab_rgb::swap::record_lq_refund(&mut s, "lq-refund".into());
+
+        let v = public_swap_view(&s, "https://lq.example", "https://btc.example");
+        assert_eq!(v.get("phase"), Some(&json!("refunding")));
+        assert_eq!(v.get("lq_refund_txid"), Some(&json!("lq-refund")));
+        assert!(v.get("btc_refund_txid").unwrap().is_null());
+        assert_eq!(
+            v.pointer("/links/lq_refund"),
+            Some(&json!("https://lq.example/tx/lq-refund"))
+        );
+        assert!(v.get("preimage_hex").unwrap().is_null());
     }
 }

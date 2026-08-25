@@ -79,6 +79,11 @@ Consequences:
   requires an explicit sweep, which is implemented
   (`lab_btc::sweep_all_demo_exits`, CLI `rgbmvp btc sweep-demo`, and
   automatically in the W5 watcher).
+- Refund recovery is tracked **per chain leg**. A Liquid refund does not make a
+  still-locked Bitcoin leg terminal (or vice versa): the session remains
+  `refunding`, the watcher retries only the unresolved funded leg after its own
+  CSV maturity, and `refunded` is emitted only after every funded leg has a
+  claim or refund txid. Legacy note-only refund records are upgraded on load.
 
 ### Mandatory migration from public-label exit keys
 

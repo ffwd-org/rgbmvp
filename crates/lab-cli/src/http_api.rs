@@ -49,11 +49,25 @@ fn leg_claim_valid(leg: &Option<lab_rgb::swap::SwapLegRgb>) -> bool {
         .unwrap_or(false)
 }
 
+fn refund_recovery_blocks(s: &lab_rgb::swap::SwapSession, action: &str) -> bool {
+    (s.btc_refund_txid.is_some() || s.lq_refund_txid.is_some())
+        && !matches!(action, "refund_btc" | "refund_lq")
+}
+
 /// Why phase is not yet `done` (browser-facing; never mentions preimage bytes).
 pub(crate) fn not_done_reason(s: &lab_rgb::swap::SwapSession) -> Option<String> {
     use lab_rgb::swap::SwapPhase;
     if matches!(s.phase, SwapPhase::Done | SwapPhase::Refunded) {
         return None;
+    }
+    if matches!(s.phase, SwapPhase::Refunding) {
+        return Some(
+            match (s.btc_refund_txid.is_some(), s.lq_refund_txid.is_some()) {
+                (false, true) => "Liquid refunded; BTC refund pending CSV maturity".into(),
+                (true, false) => "BTC refunded; Liquid refund pending CSV maturity".into(),
+                _ => "Refund recovery is still in progress".into(),
+            },
+        );
     }
     if s.btc_fund_txid.is_none() {
         return Some("BTC HTLC not funded yet".into());
@@ -107,6 +121,27 @@ pub(crate) fn swap_next_actions(s: &lab_rgb::swap::SwapSession) -> Vec<serde_jso
     use lab_rgb::swap::SwapPhase;
     let mut out = Vec::new();
     if matches!(s.phase, SwapPhase::Refunded | SwapPhase::Done) {
+        return out;
+    }
+    if matches!(s.phase, SwapPhase::Refunding) {
+        if s.btc_fund_txid.is_some() && s.btc_claim_txid.is_none() && s.btc_refund_txid.is_none() {
+            out.push(serde_json::json!({
+                "action": "refund_btc",
+                "label": "Refund BTC (after CSV)",
+                "defaults": {"fee_sats": 500},
+                "role": "alice",
+                "caution": "Requires csv_delay confirmations since fund"
+            }));
+        }
+        if s.lq_fund_txid.is_some() && s.lq_claim_txid.is_none() && s.lq_refund_txid.is_none() {
+            out.push(serde_json::json!({
+                "action": "refund_lq",
+                "label": "Refund Liquid (after CSV)",
+                "defaults": {"fee_sats": 300},
+                "role": "bob",
+                "caution": "Requires csv_delay confirmations since fund"
+            }));
+        }
         return out;
     }
     let wrap = s.rgb_wrap;
@@ -166,7 +201,12 @@ pub(crate) fn swap_next_actions(s: &lab_rgb::swap::SwapSession) -> Vec<serde_jso
             "role": "bob"
         }));
     }
-    if s.btc_fund_txid.is_some() && s.lq_fund_txid.is_some() && s.lq_claim_txid.is_none() {
+    if s.btc_fund_txid.is_some()
+        && s.lq_fund_txid.is_some()
+        && s.lq_claim_txid.is_none()
+        && s.btc_refund_txid.is_none()
+        && s.lq_refund_txid.is_none()
+    {
         // Wait for wraps before offering claim on S3
         let wraps_ok = (!wrap || s.btc_contract_id.is_none() || leg_wrapped(&s.btc_rgb))
             && (!wrap || s.lq_contract_id.is_none() || leg_wrapped(&s.lq_rgb));
@@ -188,7 +228,11 @@ pub(crate) fn swap_next_actions(s: &lab_rgb::swap::SwapSession) -> Vec<serde_jso
             }));
         }
     }
-    if s.lq_claim_txid.is_some() && s.btc_claim_txid.is_none() {
+    if s.lq_claim_txid.is_some()
+        && s.btc_claim_txid.is_none()
+        && s.btc_refund_txid.is_none()
+        && s.lq_refund_txid.is_none()
+    {
         let defaults = serde_json::json!({
             "fee_sats": 500,
             "commitment_sats": 330,
@@ -206,7 +250,7 @@ pub(crate) fn swap_next_actions(s: &lab_rgb::swap::SwapSession) -> Vec<serde_jso
             "role": "bob"
         }));
     }
-    if s.btc_fund_txid.is_some() && s.btc_claim_txid.is_none() {
+    if s.btc_fund_txid.is_some() && s.btc_claim_txid.is_none() && s.btc_refund_txid.is_none() {
         out.push(serde_json::json!({
             "action": "refund_btc",
             "label": "Refund BTC (after CSV)",
@@ -215,7 +259,7 @@ pub(crate) fn swap_next_actions(s: &lab_rgb::swap::SwapSession) -> Vec<serde_jso
             "caution": "Requires csv_delay confirmations since fund"
         }));
     }
-    if s.lq_fund_txid.is_some() && s.lq_claim_txid.is_none() {
+    if s.lq_fund_txid.is_some() && s.lq_claim_txid.is_none() && s.lq_refund_txid.is_none() {
         out.push(serde_json::json!({
             "action": "refund_lq",
             "label": "Refund Liquid (after CSV)",
@@ -238,6 +282,9 @@ pub(crate) fn swap_guide(s: &lab_rgb::swap::SwapSession) -> String {
     }
     if matches!(s.phase, lab_rgb::swap::SwapPhase::Refunded) {
         return "Refund path used. Happy-path claim is no longer available.".into();
+    }
+    if matches!(s.phase, lab_rgb::swap::SwapPhase::Refunding) {
+        return not_done_reason(s).unwrap_or_else(|| "Refund recovery is in progress.".into());
     }
     if let Some(why) = not_done_reason(s) {
         return why;
@@ -338,6 +385,12 @@ pub(crate) fn handle_swap_action_post(
         .and_then(|x| x.as_str())
         .context("action required (fund_btc|fund_lq|claim_lq|claim_btc|refund_btc|refund_lq)")?;
     let mut s = store.load(id)?;
+    if swap::hydrate_legacy_refund_txids(&mut s) {
+        store.save(&s)?;
+    }
+    if refund_recovery_blocks(&s, action) {
+        anyhow::bail!("refund recovery is in progress; only unresolved leg refunds are allowed");
+    }
 
     // Repair mistaken address-as-name from older sessions
     if s.alice_btc_wallet.starts_with("tb1") || s.alice_btc_wallet.starts_with("bc1") {
@@ -634,6 +687,9 @@ pub(crate) fn handle_swap_action_post(
             if s.btc_claim_txid.is_some() {
                 anyhow::bail!("BTC already claimed; cannot refund");
             }
+            if s.btc_refund_txid.is_some() {
+                anyhow::bail!("BTC already refunded");
+            }
             let btc = lab_btc::BtcConfig::from_env();
             let amount = s.btc_fund_sats.context("btc not funded")?;
             let utxo =
@@ -661,8 +717,7 @@ pub(crate) fn handle_swap_action_post(
                 &refund_sk,
             )?;
             let txid = lab_btc::broadcast_raw(&btc, &raw)?;
-            s.notes.push(format!("btc_refund_txid={txid}"));
-            s.phase = lab_rgb::swap::SwapPhase::Refunded;
+            swap::record_btc_refund(&mut s, txid.clone());
             store.save(&s)?;
             serde_json::json!({
                 "status": "refunded_btc",
@@ -675,6 +730,9 @@ pub(crate) fn handle_swap_action_post(
             let fee_sats = v.get("fee_sats").and_then(|x| x.as_u64()).unwrap_or(300);
             if s.lq_claim_txid.is_some() {
                 anyhow::bail!("Liquid already claimed; cannot refund");
+            }
+            if s.lq_refund_txid.is_some() {
+                anyhow::bail!("Liquid already refunded");
             }
             let amount = s.lq_fund_sats.context("lq not funded")?;
             let (txid, vout, value) = lab_chain::find_address_utxo(
@@ -707,8 +765,7 @@ pub(crate) fn handle_swap_action_post(
                 &refund_sk,
             )?;
             let claim_txid = lab_chain::broadcast_raw_hex(cfg, &raw)?;
-            s.notes.push(format!("lq_refund_txid={claim_txid}"));
-            s.phase = lab_rgb::swap::SwapPhase::Refunded;
+            swap::record_lq_refund(&mut s, claim_txid.clone());
             store.save(&s)?;
             serde_json::json!({
                 "status": "refunded_lq",
@@ -1285,4 +1342,47 @@ pub(crate) fn handle_bfa_audit_post_public(body: &str) -> Result<lab_rgb::bfa::B
         anyhow::bail!("public audit does not fetch witness transactions")
     };
     lab_rgb::bfa::audit_history(&hist, &no_network)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partial_refund_session() -> lab_rgb::swap::SwapSession {
+        let mut s = lab_rgb::swap::init_swap(
+            &lab_rgb::htlc::DemoKeyring::new([0x44; 32]).unwrap(),
+            "partial-refund-ui",
+            6,
+            "btc-alice",
+            "bob",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        s.btc_fund_txid = Some("btc-fund".into());
+        s.lq_fund_txid = Some("lq-fund".into());
+        lab_rgb::swap::record_lq_refund(&mut s, "lq-refund".into());
+        s
+    }
+
+    #[test]
+    fn partial_refund_offers_only_the_unresolved_leg() {
+        let s = partial_refund_session();
+        let actions = swap_next_actions(&s);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].get("action"), Some(&serde_json::json!("refund_btc")));
+        assert_eq!(
+            not_done_reason(&s).as_deref(),
+            Some("Liquid refunded; BTC refund pending CSV maturity")
+        );
+    }
+
+    #[test]
+    fn partial_refund_blocks_return_to_the_claim_path() {
+        let s = partial_refund_session();
+        assert!(refund_recovery_blocks(&s, "claim_lq"));
+        assert!(refund_recovery_blocks(&s, "claim_btc"));
+        assert!(!refund_recovery_blocks(&s, "refund_btc"));
+    }
 }

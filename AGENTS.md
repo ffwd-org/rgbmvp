@@ -79,6 +79,9 @@ Contract: [docs/TESTNET_PUBLIC_SWAPS.md](docs/TESTNET_PUBLIC_SWAPS.md).
   public bind without it, or with a group/world-readable key.
 - The refund watcher may only touch ids it minted (`demo-<epoch>-<seq>`) — never
   an operator's swap session.
+- Refund completion is per leg: a first-chain refund leaves the session
+  `refunding`; the watcher must keep retrying the other funded leg after its
+  independent CSV maturity. Only both resolved legs may become `refunded`.
 - **HTLC exits do NOT pay the funding wallet.** Claim and refund both pay one
   of four P2WPKH addresses whose private keys are hardened children of the
   custody-backed demo-exit seed. Public labels must never determine a signing
