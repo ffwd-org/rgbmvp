@@ -88,6 +88,15 @@
       return Number(n).toLocaleString() + ' sats';
     }
 
+    function balanceMeta(x) {
+      const status = x.balance_status || 'unavailable';
+      const source = x.balance_source || 'unknown';
+      const observed = Number(x.balance_as_of_epoch || 0);
+      const age = observed ? Math.max(0, Math.round(Date.now() / 1000 - observed)) : null;
+      const ageText = age == null ? '' : ` · ${age}s ago`;
+      return `${status} · ${source}${ageText}`;
+    }
+
     async function load() {
       $('err').textContent = '';
       $('stamp').textContent = '…';
@@ -119,6 +128,7 @@
             <div class="chain">${esc(x.chain || '?')}</div>
             <h3>${esc(x.name)}${x.role && x.role !== x.name ? ' · ' + esc(x.role) : ''}</h3>
             <div class="bal">${esc(fmtSats(bal))} <span class="muted">${esc(label)}</span></div>
+            <div class="muted" style="font-size:0.82rem">${esc(balanceMeta(x))}</div>
             <div class="addr">${esc(x.address || '—')}</div>
             ${x.explorer ? `<div style="margin-top:0.4rem"><a href="${safeUrl(x.explorer)}" target="_blank" rel="noopener noreferrer">explorer ↗</a></div>` : ''}
           `;

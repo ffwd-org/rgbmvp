@@ -44,6 +44,13 @@ Mnemonics live in that JSON (testnet-only public fixtures). On disk after bootst
 .rgbmvp/wallet_registry.json        # addresses only (safe to share locally)
 ```
 
+The public `/demo` board never receives these files. Bitcoin balances come
+from Esplora. Confidential Liquid amounts require blinding material, so the
+Cloud Run board uses a separately mounted bundle of watch-only descriptors
+(public derivation keys + SLIP77) and returns only aggregate testnet L-BTC with
+`balance_status` and `balance_as_of_epoch`. Fixture mnemonics are not uploaded
+for this purpose. See `deploy/README.md` §5.3.1.
+
 ---
 
 ## Bootstrap (every machine / CI)

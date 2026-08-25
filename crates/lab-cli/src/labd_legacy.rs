@@ -18,6 +18,7 @@ use crate::http_api::{
     handle_rgb_issue_post, handle_rgb_transfer_post, handle_swap_action_post,
     handle_swap_init_post, handle_verify_post, list_rgb_contracts, list_swap_ids, public_swap_view,
 };
+use crate::wallet_watch::WalletBalanceBoard;
 
 pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
     let listener = TcpListener::bind(bind).with_context(|| format!("bind {bind}"))?;
@@ -54,6 +55,16 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
     let store = RgbStore::new(&cfg.data_dir);
     let swap_store = SwapStore::new(&cfg.data_dir);
     let verify_limiter = Arc::new(RateLimiter::from_env_verify());
+    let wallet_balance_board = Arc::new(
+        WalletBalanceBoard::from_config(cfg)
+            .context("public wallet balance board configuration refused")?,
+    );
+    eprintln!(
+        "  demo wallet balances: source={} wallets={} refresh={}s",
+        wallet_balance_board.source(),
+        wallet_balance_board.configured_wallets(),
+        wallet_balance_board.refresh_secs()
+    );
     eprintln!("  GET  /status · /artifacts/public/*  (public evidence)");
     eprintln!(
         "  verify rate limit: {}/min per peer (LABD_VERIFY_RATE_LIMIT)",
@@ -383,7 +394,7 @@ pub(crate) fn serve_labd_legacy(cfg: &Config, bind: &str) -> Result<()> {
                 }
             }
         } else if method == "GET" && path == "/v1/demo/wallets" {
-            match demo_wallets(cfg) {
+            match demo_wallets(cfg, &wallet_balance_board) {
                 Ok(v) => (
                     "200 OK",
                     "application/json",
