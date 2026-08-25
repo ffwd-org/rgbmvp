@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use lab_core::{Config, DemoSwapPolicy, Floats};
 use lab_rgb::storage::RgbStore;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::http_api::{handle_rgb_issue_post, handle_rgb_transfer_post, handle_verify_post};
@@ -15,11 +16,126 @@ pub const SENDER_WALLET: &str = "bob";
 pub const RECEIVER_WALLET: &str = "alice";
 pub const ASSET_NAME: &str = "SwapLab RGB Test Asset";
 pub const ASSET_TICKER: &str = "SLAB";
-pub const ASSET_SUPPLY: u64 = 1_000_000;
-pub const TRANSFER_AMOUNT: u64 = 100_000;
+pub const ASSET_SUPPLY: u64 = 1_000;
+pub const TRANSFER_AMOUNT: u64 = 1;
 pub const COMMITMENT_SATS: u64 = 500;
-pub const RECEIVER_SATS: u64 = 1_000;
+pub const RECEIVER_SATS: u64 = 500;
 pub const STATIC_ENTROPY: u64 = 2_024;
+pub const REBALANCE_TRIGGER_SATS: u64 = 50_000;
+pub const REBALANCE_TARGET_SATS: u64 = 100_000;
+pub const REBALANCE_SOURCE_FLOOR_SATS: u64 = 20_000;
+pub const REBALANCE_MAX_TRANSFER_SATS: u64 = 25_000;
+pub const MIN_LBTC_SEND_SATS: u64 = 500;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RebalancePolicy {
+    pub trigger_below_sats: u64,
+    pub target_sats: u64,
+    pub source_floor_sats: u64,
+    pub max_transfer_sats: u64,
+}
+
+impl Default for RebalancePolicy {
+    fn default() -> Self {
+        Self {
+            trigger_below_sats: REBALANCE_TRIGGER_SATS,
+            target_sats: REBALANCE_TARGET_SATS,
+            source_floor_sats: REBALANCE_SOURCE_FLOOR_SATS,
+            max_transfer_sats: REBALANCE_MAX_TRANSFER_SATS,
+        }
+    }
+}
+
+pub fn rebalance_policy_from_env() -> RebalancePolicy {
+    RebalancePolicy {
+        trigger_below_sats: env_u64(
+            "LABD_RGB_DEMO_REBALANCE_TRIGGER_SATS",
+            REBALANCE_TRIGGER_SATS,
+        ),
+        target_sats: env_u64("LABD_RGB_DEMO_REBALANCE_TARGET_SATS", REBALANCE_TARGET_SATS),
+        source_floor_sats: env_u64(
+            "LABD_RGB_DEMO_REBALANCE_SOURCE_FLOOR_SATS",
+            REBALANCE_SOURCE_FLOOR_SATS,
+        ),
+        max_transfer_sats: env_u64(
+            "LABD_RGB_DEMO_REBALANCE_MAX_TRANSFER_SATS",
+            REBALANCE_MAX_TRANSFER_SATS,
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RebalancePlan {
+    pub status: &'static str,
+    pub from_wallet: &'static str,
+    pub to_wallet: &'static str,
+    pub source_balance_sats: Option<u64>,
+    pub destination_balance_sats: Option<u64>,
+    pub recommended_amount_sats: u64,
+    pub operator_action_required: bool,
+    pub reason: String,
+    pub policy: RebalancePolicy,
+}
+
+pub fn rebalance_plan(
+    source_balance_sats: Option<u64>,
+    destination_balance_sats: Option<u64>,
+    policy: RebalancePolicy,
+) -> RebalancePlan {
+    let base = |status, amount, required, reason| RebalancePlan {
+        status,
+        from_wallet: RECEIVER_WALLET,
+        to_wallet: SENDER_WALLET,
+        source_balance_sats,
+        destination_balance_sats,
+        recommended_amount_sats: amount,
+        operator_action_required: required,
+        reason,
+        policy,
+    };
+    let (Some(source), Some(destination)) = (source_balance_sats, destination_balance_sats) else {
+        return base(
+            "unavailable",
+            0,
+            false,
+            "Live Alice and Bob balances are required; unknown balances fail closed.".into(),
+        );
+    };
+    if destination >= policy.trigger_below_sats {
+        return base(
+            "balanced",
+            0,
+            false,
+            format!(
+                "Bob is at or above the {} sat trigger.",
+                policy.trigger_below_sats
+            ),
+        );
+    }
+    let desired = policy.target_sats.saturating_sub(destination);
+    let available = source.saturating_sub(policy.source_floor_sats);
+    let amount = desired.min(available).min(policy.max_transfer_sats);
+    if amount < MIN_LBTC_SEND_SATS {
+        return base(
+            "blocked",
+            0,
+            true,
+            "Rebalance is due, but the bounded transfer would be below the 500 sat minimum.".into(),
+        );
+    }
+    base(
+        "recommended",
+        amount,
+        true,
+        format!("Move at most {amount} sats from Alice to Bob using the operator CLI."),
+    )
+}
+
+#[derive(Debug)]
+pub struct RunResult {
+    pub public: Value,
+    pub sender_debit_sats: u64,
+}
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -115,7 +231,7 @@ fn receiver_address(cfg: &Config) -> Result<String> {
 
 /// Execute the full server-fixed workflow. Public output is selected field by
 /// field so internal paths and raw transaction material never escape.
-pub fn run(cfg: &Config) -> Result<Value> {
+pub fn run(cfg: &Config) -> Result<RunResult> {
     let store = RgbStore::new(&cfg.data_dir);
     let receiver = receiver_address(cfg)?;
 
@@ -158,6 +274,18 @@ pub fn run(cfg: &Config) -> Result<Value> {
         .pointer("/broadcast/explorer_url")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let fee_sats = transferred
+        .pointer("/broadcast/fee_sats")
+        .and_then(Value::as_u64)
+        .context("transfer result missing exact fee")?;
+    let nonrecoverable_cost_sats = transferred
+        .pointer("/broadcast/nonrecoverable_cost_sats")
+        .and_then(Value::as_u64)
+        .context("transfer result missing nonrecoverable cost")?;
+    let sender_debit_sats = transferred
+        .pointer("/broadcast/sender_debit_sats")
+        .and_then(Value::as_u64)
+        .context("transfer result missing sender debit")?;
 
     let verify_body = json!({"plan_id": plan_id, "txid": txid}).to_string();
     // Esplora can lag a successful broadcast briefly. Retry the read-only
@@ -187,17 +315,27 @@ pub fn run(cfg: &Config) -> Result<Value> {
         .context("verify result missing proof id")?;
     let verification = verified.get("result").cloned().unwrap_or(Value::Null);
 
-    Ok(json!({
-        "status": "complete",
-        "contract_id": contract_id,
-        "plan_id": plan_id,
-        "txid": txid,
-        "proof_id": proof_id,
-        "explorer_url": explorer_url,
-        "verification": verification,
-        "parameters": fixed_parameters_json(),
-        "note": "Testnet-only workflow between predefined lab wallets. No visitor parameters or keys are accepted."
-    }))
+    Ok(RunResult {
+        public: json!({
+            "status": "complete",
+            "contract_id": contract_id,
+            "plan_id": plan_id,
+            "txid": txid,
+            "proof_id": proof_id,
+            "explorer_url": explorer_url,
+            "verification": verification,
+            "cost": {
+                "fee_sats": fee_sats,
+                "commitment_sats": COMMITMENT_SATS,
+                "controlled_transfer_sats": RECEIVER_SATS,
+                "nonrecoverable_cost_sats": nonrecoverable_cost_sats,
+                "sender_debit_sats": sender_debit_sats
+            },
+            "parameters": fixed_parameters_json(),
+            "note": "Testnet-only workflow between predefined lab wallets. No visitor parameters or keys are accepted."
+        }),
+        sender_debit_sats,
+    })
 }
 
 #[cfg(test)]
@@ -221,5 +359,21 @@ mod tests {
         assert_eq!(v["sender_wallet"], SENDER_WALLET);
         assert_eq!(v["receiver_wallet"], RECEIVER_WALLET);
         assert_eq!(v["broadcast"], true);
+        assert_eq!(v["transfer_amount"], 1);
+        assert_eq!(v["receiver_sats"], 500);
+    }
+
+    #[test]
+    fn rebalance_is_read_only_policy_output() {
+        let p = RebalancePolicy::default();
+        assert_eq!(
+            rebalance_plan(Some(103_946), Some(143_545), p).status,
+            "balanced"
+        );
+        let due = rebalance_plan(Some(100_000), Some(40_000), p);
+        assert_eq!(due.status, "recommended");
+        assert_eq!(due.recommended_amount_sats, 25_000);
+        assert!(due.operator_action_required);
+        assert_eq!(rebalance_plan(None, Some(1), p).status, "unavailable");
     }
 }

@@ -179,6 +179,30 @@ The later fixed RGB lab adds one separate exact exception,
 Liquid Testnet, and uses `/data/rgb_demo_budget.json`; it neither broadens
 `/v1/rgb/*` nor shares T1's quota ledger.
 
+The public RGB run issues a fresh 1,000-unit test contract and transfers exactly
+1 unit, the protocol minimum. Its Liquid transaction fixes both the tapret
+commitment and controlled receiver output at 500 sats. The response reports the
+final transaction fee, the nonrecoverable cost (`commitment + fee`), and Bob's
+total debit (`commitment + receiver output + fee`). Admission still reserves
+2,500 sats before execution; only a proven success settles that reservation to
+the exact debit, while unknown outcomes remain fully charged.
+
+`GET /v1/demo/wallets` also publishes a read-only rebalance assessment from the
+server-side LWK balance snapshot. There is deliberately no anonymous rebalance
+endpoint or browser button. Operators may review a non-mutating fixed-wallet
+plan and then explicitly apply it:
+
+```bash
+./target/debug/rgbmvp wallet rebalance-demo
+./target/debug/rgbmvp wallet rebalance-demo --apply
+```
+
+The default plan triggers only when Bob is below 50,000 sats, targets 100,000,
+keeps at least 20,000 sats in Alice, and caps each batch at 25,000 sats. The
+command always synchronizes both wallets first and is fixed to `alice → bob`.
+T1 swap exit sweeps already recycle swap-controlled outputs and do not use this
+RGB float rebalance path.
+
 ---
 
 ## 3. Workstreams

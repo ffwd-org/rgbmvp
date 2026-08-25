@@ -691,6 +691,11 @@ pub struct BroadcastResult {
     pub txid: String,
     pub explorer_url: String,
     pub commitment_address: String,
+    pub fee_sats: u64,
+    pub commitment_sats: u64,
+    pub controlled_transfer_sats: u64,
+    pub nonrecoverable_cost_sats: u64,
+    pub sender_debit_sats: u64,
     pub note: String,
 }
 
@@ -764,6 +769,9 @@ pub fn broadcast_commitment_tx(
     let tx = wollet
         .finalize(&mut pset)
         .map_err(|e| anyhow::anyhow!("finalize: {e}"))?;
+    let fee_sats = tx.fee_in(policy);
+    let nonrecoverable_cost_sats = commitment_sats.saturating_add(fee_sats);
+    let sender_debit_sats = nonrecoverable_cost_sats.saturating_add(bob_sats);
 
     let client = electrum_client(cfg)?;
     let txid = client
@@ -774,6 +782,11 @@ pub fn broadcast_commitment_tx(
         txid: txid.to_string(),
         explorer_url: format!("{}/tx/{}", cfg.explorer_base.trim_end_matches('/'), txid),
         commitment_address: tapret_address.into(),
+        fee_sats,
+        commitment_sats,
+        controlled_transfer_sats: bob_sats,
+        nonrecoverable_cost_sats,
+        sender_debit_sats,
         note:
             "Broadcast ok. TapretFirst requires commitment as first P2TR; verify with rgb verify."
                 .into(),

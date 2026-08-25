@@ -96,6 +96,8 @@ mnemonics are fixed.
 | `wallet balance --name bob` | Sync + balances |
 | `wallet utxos --name alice` | Seal candidates |
 | `wallet send --from alice --to bob --amount-sats N` | Rebalance |
+| `wallet rebalance-demo` | Dry-run the threshold-based fixed Alice → Bob RGB demo rebalance |
+| `wallet rebalance-demo --apply` | Broadcast only the bounded amount shown by a fresh plan |
 | `wallet send --from alice --to-address tlq1… --amount-sats N` | External pay |
 
 RGB commands should pass `--wallet alice` (or bob) explicitly:

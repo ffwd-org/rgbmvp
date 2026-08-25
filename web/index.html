@@ -444,6 +444,7 @@
     function $(id) { return document.getElementById(id); }
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const safeUrl = value => { try { const u = new URL(String(value), location.origin); return ['http:','https:'].includes(u.protocol) ? u.href : '#'; } catch (_) { return '#'; } };
+    const fmtSats = value => `${Number(value || 0).toLocaleString()} sats`;
 
     const tabButtons = [...document.querySelectorAll('.tabs [role="tab"]')];
     tabButtons.forEach((btn, index) => {
@@ -512,7 +513,7 @@
         $('rgb-demo-parameters').innerHTML =
           `<strong>${esc(p.sender_wallet || 'bob')} → ${esc(p.receiver_wallet || 'alice')}</strong> · ` +
           `${esc(p.network || 'liquid-testnet')} · ${esc(asset.ticker || 'SLAB')} · ` +
-          `transfer ${esc(p.transfer_amount || 100000)} units · ` +
+          `transfer ${esc(p.transfer_amount ?? 1)} unit${Number(p.transfer_amount ?? 1) === 1 ? '' : 's'} · ` +
           `${esc((q.usage || {}).runs_today || 0)}/${esc((q.limits || {}).daily_cap || 0)} runs today`;
         if (!q.enabled) {
           status.textContent = 'The anonymous RGB flow is currently disabled.';
@@ -542,7 +543,11 @@
         $('rgb-demo-output').textContent = JSON.stringify(j, null, 2);
         if (!r.ok) throw new Error(j.error || j.message || r.statusText);
         const link = j.explorer_url ? ` · <a href="${safeUrl(j.explorer_url)}" target="_blank" rel="noopener noreferrer">explorer ↗</a>` : '';
-        status.innerHTML = `<span class="ok">Complete</span> · contract <code>${esc(j.contract_id)}</code> · proof <code>${esc(j.proof_id)}</code>${link}`;
+        const cost = j.cost || {};
+        const costText = cost.nonrecoverable_cost_sats != null
+          ? ` · chain cost ${esc(fmtSats(cost.nonrecoverable_cost_sats))} (${esc(fmtSats(cost.fee_sats))} fee)`
+          : '';
+        status.innerHTML = `<span class="ok">Complete</span> · contract <code>${esc(j.contract_id)}</code> · proof <code>${esc(j.proof_id)}</code>${costText}${link}`;
       } catch (error) {
         status.innerHTML = `<span class="bad">Run failed:</span> ${esc(error)}`;
       } finally {
